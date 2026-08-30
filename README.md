@@ -5,8 +5,8 @@ Two small tools for Palworld saves using the newer **Oodle-compressed
 
 - **hostfix** — migrate a character from a **dedicated server** save into
   a **single-player / co-op host** save, keeping their level, stats,
-  inventory, unlocked tech, owned Pals, guild membership, and built
-  structures intact.
+  inventory, unlocked tech, owned Pals, guild membership, built
+  structures, and fast-travel/map reveal progress intact.
 - **optioneditor** — edit a world's settings (`WorldOption.sav`):
   difficulty, day/night speed, every XP/damage/drop-rate slider, PvP and
   multiplayer toggles, and (for a dedicated server) the server
@@ -223,11 +223,16 @@ world (it does this if you previously joined the same server as a
 client). Launch Palworld and the world should appear in your load list
 with your character intact.
 
-**Note:** this does not touch `LocalData.sav` (per-install local settings
-— waypoints, map reveal, etc. — which has its own format quirks and isn't
-needed for the character/world data to load correctly). If you already
-have one for this world slot, leave it in place; otherwise Palworld
-generates a fresh one automatically.
+**Note:** `LocalData.sav` (fast-travel/map reveal progress, boss-encounter
+flags, and similar per-save-slot local state) is carried over too if the
+source world folder has one, so you shouldn't have to re-discover
+fast-travel points you'd already found. It's copied through as-is (we
+don't parse or edit its contents, just normalize the compression) rather
+than being tied to your character specifically, so treat it as
+best-effort. If you already have a `LocalData.sav` in your target save
+slot that you'd rather keep (e.g. from previously joining the same server
+as a client from this PC), back it up before copying the migrated files
+over it.
 
 ## Safety
 
@@ -264,7 +269,10 @@ edit binary save file internals; that's inherently not risk-free.
   kind of migration, not specific to this one) — if your base/guild
   doesn't look right after loading, that's the most likely place to
   check.
-- `LocalData.sav` isn't migrated by hostfix (see above).
+- `LocalData.sav` is copied through opaquely (see above) — if your game
+  version's internal layout for it ever changes in a way that breaks this,
+  hostfix will print a warning and fall back to a raw file copy rather
+  than fail the whole migration.
 - optioneditor's dropdown-style settings (`Difficulty`, `DeathPenalty`,
   `LogFormatType`, `RandomizerType`) are validated against the choices
   known at the time this was written — if a future game update adds new

@@ -398,9 +398,14 @@ def perform_migration(
     player.write(new_player_path)
     print(f"Wrote {new_player_path}  ({p_n} references migrated)")
 
-    # --- LevelMeta.sav / WorldOption.sav: pass through (also normalizes
-    # PlM -> PlZ), optionally rename the world.
-    for name in ("LevelMeta.sav", "WorldOption.sav"):
+    # --- LevelMeta.sav / WorldOption.sav / LocalData.sav: pass through
+    # (also normalizes PlM -> PlZ), optionally rename the world.
+    # LocalData.sav holds per-save-slot local state like fast-travel/map
+    # reveal progress and boss-encounter flags -- it's opaque to us (we
+    # don't parse its contents) but decompresses/recompresses cleanly, so
+    # carrying it over means you don't lose your explored fast-travel
+    # points and have to walk up to them again to re-reveal them.
+    for name in ("LevelMeta.sav", "WorldOption.sav", "LocalData.sav"):
         src = world_dir / name
         if not src.exists():
             continue
@@ -421,9 +426,7 @@ def perform_migration(
         "into your local single-player save slot, e.g.:\n"
         r"  %LOCALAPPDATA%\Pal\Saved\SaveGames\<YourSteamID>\<AnyWorldGUID>" "\\"
         "\n(create that WorldGUID folder if you don't already have one for this "
-        "world -- the folder name doesn't matter, Palworld reads whatever's inside it).\n"
-        "NOTE: this does not touch LocalData.sav. If you have an existing LocalData.sav "
-        "for this world slot, leave it in place; otherwise Palworld will generate a fresh one."
+        "world -- the folder name doesn't matter, Palworld reads whatever's inside it)."
     )
     return out_dir
 
