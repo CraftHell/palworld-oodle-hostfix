@@ -40,6 +40,12 @@ Usage
     # screen).
     python optioneditor.py export-ini /path/to/WorldOption.sav
 
+    # Apply a bundled preset instead of changing fields one at a time.
+    # Also available from the interactive menu ([P] on the category
+    # screen).
+    python optioneditor.py apply-preset --list
+    python optioneditor.py apply-preset /path/to/WorldOption.sav casual
+
 Always makes a ``.bak`` backup of the original file the first time it
 writes to a given path in a session, and never touches anything until you
 confirm.
@@ -126,6 +132,101 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "ItemContainerForceMarkDirtyInterval", "PlayerDataPalStorageUpdateCheckTickInterval",
     ]),
 ]
+
+# --------------------------------------------------------------------------
+# Presets -- small, targeted bundles of field changes, not full rewrites of
+# every setting. Deliberately conservative: each one only touches a
+# handful of fields relevant to its theme (a preset that repeats 60
+# unchanged values next to the ones that matter is harder to review, not
+# easier). Difficulty/ExpRate/PalCaptureRate here roughly track Palworld's
+# own built-in Casual/Normal/Hard difficulty presets; the PvP/PvE ones are
+# just the toggles that actually control player-vs-player combat, since
+# Difficulty doesn't touch those. Feel free to treat these as a starting
+# point and adjust individual fields afterward -- that's exactly what
+# applying a preset first, then reviewing/editing categories normally,
+# is for.
+# --------------------------------------------------------------------------
+PRESETS: dict[str, dict[str, Any]] = {
+    "casual": {
+        "summary": "Easier survival -- faster leveling, generous captures, no permanent death penalty.",
+        "values": {
+            "Difficulty": "Casual",
+            "ExpRate": "2.0",
+            "PalCaptureRate": "2.0",
+            "DeathPenalty": "None",
+            "bEnableInvaderEnemy": "false",
+        },
+    },
+    "normal": {
+        "summary": "The game's own default difficulty-related values.",
+        "values": {
+            "Difficulty": "Normal",
+            "ExpRate": "1.0",
+            "PalCaptureRate": "1.0",
+            "DeathPenalty": "Item",
+            "bEnableInvaderEnemy": "true",
+        },
+    },
+    "hard": {
+        "summary": "Tougher survival -- slower leveling, stingier captures, lose equipment on death.",
+        "values": {
+            "Difficulty": "Hard",
+            "ExpRate": "0.7",
+            "PalCaptureRate": "0.7",
+            "DeathPenalty": "ItemAndEquipment",
+            "bEnableInvaderEnemy": "true",
+        },
+    },
+    "pvp": {
+        "summary": "Turns on player-vs-player combat and related toggles. Doesn't change PvE rates.",
+        "values": {
+            "bIsPvP": "true",
+            "bEnablePlayerToPlayerDamage": "true",
+            "bEnableFriendlyFire": "false",
+            "bBuildAreaLimit": "true",
+            "bEnableDefenseOtherGuildPlayer": "true",
+        },
+    },
+    "pve": {
+        "summary": "Turns player-vs-player combat off (the usual choice for a co-op-focused server).",
+        "values": {
+            "bIsPvP": "false",
+            "bEnablePlayerToPlayerDamage": "false",
+        },
+    },
+}
+
+
+def apply_preset(settings: dict, preset_name: str) -> list[tuple[str, str, str]]:
+    """Applies PRESETS[preset_name] to `settings` IN PLACE. Returns
+    [(field, before, after), ...] for fields that actually changed (a
+    field already matching the preset's value isn't reported). Raises
+    OptionEditorError for an unknown preset name, or if a preset
+    references a field this file doesn't have (rather than applying it
+    partially) -- both should only happen on a mistyped preset name or a
+    save from a very different game version."""
+    preset = PRESETS.get(preset_name)
+    if preset is None:
+        raise OptionEditorError(
+            f"No such preset: {preset_name!r}. Known presets: {', '.join(PRESETS)}"
+        )
+    changes: list[tuple[str, str, str]] = []
+    for field, value_str in preset["values"].items():
+        if field not in settings:
+            raise OptionEditorError(
+                f"Preset {preset_name!r} references {field!r}, which isn't in this file "
+                "(maybe a different game version?) -- refusing to apply it partially."
+            )
+        prop = settings[field]
+        before = format_value(field, prop)
+        try:
+            set_value(field, prop, value_str)
+        except ValueError as e:
+            raise OptionEditorError(f"Preset {preset_name!r}, field {field!r}: {e}")
+        after = format_value(field, prop)
+        if before != after:
+            changes.append((field, before, after))
+    return changes
 
 
 class OptionEditorError(Exception):
@@ -477,6 +578,33 @@ def _run_export_ini_prompt(world_option_path: Path) -> None:
     )
 
 
+def _run_apply_preset_prompt(settings: dict) -> bool:
+    """Returns True if any field was actually changed (so the caller can
+    mark the session dirty)."""
+    print("\nAvailable presets:")
+    names = list(PRESETS)
+    for i, name in enumerate(names, start=1):
+        print(f"  [{i}] {name}  -- {PRESETS[name]['summary']}")
+    print("  [0] Cancel")
+    choice = _prompt_choice("Pick a preset to apply", len(names))
+    if choice == 0:
+        print("Cancelled.")
+        return False
+    preset_name = names[choice - 1]
+    try:
+        changes = apply_preset(settings, preset_name)
+    except OptionEditorError as e:
+        print(f"\nSomething went wrong:\n  {e}")
+        return False
+    if not changes:
+        print(f"\nNo changes -- settings already match the {preset_name!r} preset.")
+        return False
+    print(f"\nApplied {preset_name!r} ({len(changes)} field(s) changed, not saved yet):")
+    for field, before, after in changes:
+        print(f"  {field}: {before} -> {after}")
+    return True
+
+
 def run_interactive(initial_path: str | None = None) -> None:
     print("=" * 70)
     print(" optioneditor -- edit a Palworld WorldOption.sav")
@@ -506,15 +634,20 @@ def run_interactive(initial_path: str | None = None) -> None:
             print(f"  [{i}] {cat_name}  ({len(fields)} settings)")
         print(f"  [0] {'Save and exit' if dirty else 'Exit'}" + (" (unsaved changes!)" if dirty else ""))
         print("  [E] Export these settings as a PalWorldSettings.ini (for a dedicated server)")
+        print("  [P] Apply a bundled preset (casual/normal/hard/pvp/pve)")
         try:
-            raw = input(f"Pick a category [0-{len(categories)}, or E]: ").strip()
+            raw = input(f"Pick a category [0-{len(categories)}, or E/P]: ").strip()
         except EOFError:
             raise EditAborted()
         if raw.lower() == "e":
             _run_export_ini_prompt(path)
             continue
+        if raw.lower() == "p":
+            if _run_apply_preset_prompt(settings):
+                dirty = True
+            continue
         if not (raw.isdigit() and 0 <= int(raw) <= len(categories)):
-            print(f"  (please enter a number from 0 to {len(categories)}, or E)")
+            print(f"  (please enter a number from 0 to {len(categories)}, or E/P)")
             continue
         cat_choice = int(raw)
         if cat_choice == 0:
@@ -595,6 +728,30 @@ def cmd_export_ini(args: argparse.Namespace) -> None:
             print(f"    {name}  ({reason})")
 
 
+def cmd_apply_preset(args: argparse.Namespace) -> None:
+    if args.list or args.path is None or args.preset is None:
+        print("Available presets:")
+        for name, p in PRESETS.items():
+            print(f"  {name}: {p['summary']}")
+        if not args.list and (args.path is None or args.preset is None):
+            print("\nUsage: optioneditor.py apply-preset <path> <preset>")
+        return
+    path = Path(args.path)
+    sav, dumped, settings = load_world_option(path)
+    try:
+        changes = apply_preset(settings, args.preset)
+    except OptionEditorError as e:
+        sys.exit(str(e))
+    if not changes:
+        print(f"No changes -- settings already match the {args.preset!r} preset.")
+        return
+    for field, before, after in changes:
+        print(f"  {field}: {before} -> {after}")
+    out_path = Path(args.out) if args.out else path
+    save_world_option(sav, dumped, out_path, backup=not args.no_backup)
+    print(f"\nWrote {out_path}" + ("" if args.no_backup else f"  (backup at {out_path}.bak if it existed)"))
+
+
 def main() -> None:
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and Path(sys.argv[1]).suffix.lower() == ".sav"):
         # No arguments, or just a dropped-in file path -- run the friendly
@@ -644,6 +801,19 @@ def main() -> None:
     )
     p_export.add_argument("--force", action="store_true", help="Overwrite --out if it already exists")
     p_export.set_defaults(func=cmd_export_ini)
+
+    p_preset = sub.add_parser(
+        "apply-preset", help="Apply a bundled setting preset (e.g. casual/hard/pvp)"
+    )
+    p_preset.add_argument("path", nargs="?", default=None, help="Path to WorldOption.sav")
+    p_preset.add_argument(
+        "preset", nargs="?", default=None,
+        help="Preset name -- omit (or pass --list) to see available presets",
+    )
+    p_preset.add_argument("--list", action="store_true", help="List available presets and exit")
+    p_preset.add_argument("--out", default=None, help="Write to a different file instead of in-place")
+    p_preset.add_argument("--no-backup", action="store_true", help="Don't write a .bak backup")
+    p_preset.set_defaults(func=cmd_apply_preset)
 
     args = parser.parse_args()
     try:

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.bak
+
+# Don't accidentally commit real save data
+*.sav
+*.sav.json

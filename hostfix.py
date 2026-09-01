@@ -11,18 +11,18 @@ Migrate a Palworld character between a *dedicated server* save and a
   building pieces), keeping their level, inventory, and world progress
   intact.
 - `unhost`: single-player/co-op -> a fresh, never-joined dedicated server.
-  Moves the character's level, inventory, and owned Pals; guild membership
-  and built structures are a known limitation for this direction
-  specifically (see scoped_unhost_swap()'s docstring/comment in this file,
-  and the README's Limitations section, for why).
+  Moves the character's level, inventory, owned Pals, and guild membership;
+  built structures are a known limitation for this direction specifically
+  (see scoped_unhost_swap()'s docstring/comment in this file, and the
+  README's Limitations section, for why).
 - `sync`: single-player/co-op -> an ALREADY-LIVE, already-populated
   dedicated server. Use this instead of `unhost` whenever the destination
   server already has real history (for you and/or other people) -- it
   surgically splices in only the target player's own character, owned
-  Pals, and personal containers, leaving every other player, the guild(s),
-  and built structures completely untouched (see the module comment above
-  `_dump_gvas` for why `unhost`'s whole-file approach would be destructive
-  here).
+  Pals, personal containers, and guild membership, leaving every other
+  player, every other player's guild data, and built structures completely
+  untouched (see the module comment above `_dump_gvas` for why `unhost`'s
+  whole-file approach would be destructive here).
 
 Why this exists
 ----------------
@@ -123,13 +123,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import io
 import json
 import shutil
+import struct
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import palgroup
 from palcommon import (
     GUID_STR_RE,
     SINGLEPLAYER_HOST_UID,
@@ -394,15 +398,29 @@ class MigrationAborted(Exception):
 #      fields the game doesn't re-serialize with type info.
 #
 # Guild membership (GroupSaveDataMap) and placed-building ownership
-# (MapObjectSaveData) store their references inside a different, fully
-# opaque, game-custom binary encoding with no structural landmark at all.
-# Verified empirically that even scoping a blind search to one guild's or
-# one building's own small RawData blob still produces a large majority
-# of false positives for this specific low-entropy ID (94% false for
-# buildings, 78% false for guild data, measured on a real world save).
-# There's no reliable way to migrate those two for the low-entropy case,
-# so `unhost` deliberately leaves them untouched rather than guess -- see
-# the note printed after a successful run.
+# (MapObjectSaveData) store their references inside a different, opaque-
+# looking, game-custom binary encoding with no structural landmark at the
+# byte-search level. Verified empirically that even scoping a blind search
+# to one guild's or one building's own small RawData blob still produces a
+# large majority of false positives for this specific low-entropy ID
+# (94% false for buildings, 78% false for guild data, measured on a real
+# world save) -- so a blind byte search was never going to be safe for
+# either.
+#
+# Guild membership turned out to have a real, decodable structure after
+# all (see palgroup.py) -- it's just that palworld-save-tools' own bundled
+# decoder for it is stale against the current save format. `unhost` and
+# `sync` both migrate guild membership structurally now (see
+# migrate_guild_membership_unhost/_sync below). Placed-building ownership
+# does not have the same escape hatch: even the actively-maintained
+# reference implementation palgroup.py is ported from treats that field as
+# routinely liable to fail to parse and falls back to raw bytes per
+# object, and parsing it against this project's real save data throws
+# outright ("Warning: EOF not reached") rather than failing on some
+# narrower edge case. There's no reliable way to migrate placed/built
+# structures' ownership right now, so both directions deliberately leave
+# it untouched rather than guess -- see the note printed after a
+# successful run.
 # --------------------------------------------------------------------------
 _GUID_MARKER = b"Guid\x00"
 _GUID_VALUE_OFFSET = len(_GUID_MARKER) + 16 + 1  # + struct_id(16) + has-property-guid flag(1)
@@ -690,10 +708,14 @@ def _unhost_core(
     print("Sample contexts (sanity-check these look like real save data, not garbage):")
     for ctx in sample_contexts(level.raw_gvas, old_uid, n=3):
         print(f"    ...{ctx!r}")
+
+    print("\nChecking guild membership...")
+    new_raw, guild_msg = migrate_guild_membership_unhost(new_raw, old_uid_str, new_uid_str)
+    print(f"  {guild_msg}")
     print(
-        "\nNote: guild membership and any placed/built structures can't be safely\n"
-        "verified for this ID and are intentionally left untouched -- see the\n"
-        "'Limitations' section of the README."
+        "\nNote: placed/built structures' ownership can't be safely verified for "
+        "this ID and is intentionally left untouched -- see the 'Limitations' "
+        "section of the README."
     )
 
     if not yes:
@@ -855,11 +877,11 @@ def perform_unhost(
         "fully stopped before copying these files in, then start it back up "
         "and reconnect.\n\n"
         "NOTE: LocalData.sav was intentionally not copied -- dedicated servers "
-        "don't use it. Guild membership and any structures you'd already built "
-        "were also intentionally left as-is (see the README's Limitations "
-        "section) -- you may need to create/rejoin a guild and rebuild or "
-        "reclaim your base on the new server. Worth double-checking "
-        "WorldOption.sav's server settings "
+        "don't use it. Any structures you'd already built were intentionally "
+        "left as-is under your old ID (see the README's Limitations section) -- "
+        "you may need to reclaim your base on the new server; your guild "
+        "membership, if any, was updated automatically (see above). Worth "
+        "double-checking WorldOption.sav's server settings "
         "(ServerName, ServerPassword, PublicPort, bIsMultiplay, etc. -- see "
         "optioneditor) before starting the server for real."
     )
@@ -893,9 +915,12 @@ def perform_unhost(
 #     equipped gear, party, Palbox -- read cleanly off each side's own
 #     Players/<uid>.sav, which (unlike the map's RawData blobs) is NOT
 #     opaque)
-# Every other player, GroupSaveDataMap (guild), and MapObjectSaveData
-# (buildings) are left completely alone -- sourced only from the
-# destination and never even inspected for edits.
+# Every other player and MapObjectSaveData (buildings) are left completely
+# alone -- sourced only from the destination and never even inspected for
+# edits. GroupSaveDataMap (guild) gets one narrow, separate pass afterward
+# (see migrate_guild_membership_sync in palgroup.py's neighborhood above)
+# that only ever touches the target player's own row or adds one brand-new
+# entry for them -- never any other player's guild data.
 #
 # Collision handling: if a Pal being added from the source has an
 # InstanceId that also exists in a destination entry NOT being replaced
@@ -927,6 +952,224 @@ def _reserialize_gvas(dumped: dict) -> bytes:
 
     new_gvas = GvasFile.load(dumped)
     return new_gvas.write({})
+
+
+# --------------------------------------------------------------------------
+# Guild membership migration (GroupSaveDataMap) -- see palgroup.py for the
+# binary format and why palworld-save-tools' own decoder for this field
+# can't be used. Building/structure ownership (MapObjectSaveData) has no
+# equivalent here: even the actively-maintained reference implementation
+# this module is ported from treats that field as liable to fail to parse
+# per-object and falls back to leaving it as raw bytes -- and directly
+# verified against real save data, parsing it outright raises ("Warning:
+# EOF not reached") rather than something narrower like a single unknown
+# object type. There's no reliable way to migrate placed/built structures'
+# ownership right now, so neither `unhost` nor `sync` attempt it.
+# --------------------------------------------------------------------------
+def _swap_uid_in_guild_variant(variant, old_tuple: tuple, new_tuple: tuple) -> None:
+    """Mutates a GuildGroup/IndependentGuildGroup in place, swapping every
+    reference to old_tuple (admin, member rows, last-name-modifier, guild
+    marker owners) to new_tuple. Never touches guild_name, base data, or
+    any other player's row."""
+    if isinstance(variant, palgroup.GuildGroup):
+        tail = variant.tail
+        if tail.admin_player_uid == old_tuple:
+            tail.admin_player_uid = new_tuple
+        for p in tail.players:
+            if p.player_uid == old_tuple:
+                p.player_uid = new_tuple
+        if variant.last_guild_name_modifier_player_uid == old_tuple:
+            variant.last_guild_name_modifier_player_uid = new_tuple
+        for m in variant.guild_markers:
+            if m.owner_player_uid == old_tuple:
+                m.owner_player_uid = new_tuple
+    elif isinstance(variant, palgroup.IndependentGuildGroup):
+        if variant.player_uid == old_tuple:
+            variant.player_uid = new_tuple
+
+
+def _fresh_group_id(*wsds: dict) -> tuple:
+    """A random group_id guaranteed not to collide with any existing
+    GroupSaveDataMap key across every worldSaveData dict given."""
+    existing: set[tuple] = set()
+    for wsd in wsds:
+        gsm = wsd.get("GroupSaveDataMap", {}).get("value") or []
+        for entry in gsm:
+            key = entry.get("key")
+            if isinstance(key, str):
+                existing.add(palgroup.uid_str_to_tuple(key))
+    for _ in range(1000):
+        candidate = struct.unpack("<IIII", uuid.uuid4().bytes)
+        if candidate not in existing:
+            return candidate
+    raise HostfixError("Could not generate a unique guild ID -- please try again.")
+
+
+def migrate_guild_membership_unhost(raw: bytes, old_uid_str: str, new_uid_str: str) -> tuple[bytes, str]:
+    """In-place relabel for `unhost`: old_uid_str and new_uid_str both live
+    in the SAME file (unhost never merges two worlds), so this only ever
+    needs to rename a reference, never invent or drop one -- base camps,
+    guild-owned Pal handles, and every other member stay exactly as they
+    already are. Returns (possibly-updated raw_gvas, human-readable
+    summary)."""
+    old_tuple = palgroup.uid_str_to_tuple(old_uid_str)
+    new_tuple = palgroup.uid_str_to_tuple(new_uid_str)
+
+    gvas, dumped = _dump_gvas(raw)
+    wsd = dumped["properties"]["worldSaveData"]["value"]
+
+    ok, reason = palgroup.verify_group_map_roundtrip(wsd)
+    if not ok:
+        return raw, (
+            f"Guild membership left untouched -- {reason}, so this was "
+            "skipped for safety (exactly like before this feature existed)."
+        )
+
+    touched = 0
+    for entry, gt in palgroup.iter_group_entries(wsd):
+        if gt not in palgroup.GUILD_TYPES:
+            continue
+        gd = palgroup.GroupData.decode(palgroup.get_raw_data(entry), gt)
+        if old_tuple not in gd.player_uids():
+            continue
+        _swap_uid_in_guild_variant(gd.variant, old_tuple, new_tuple)
+        palgroup.set_raw_data(entry, gd.encode())
+        touched += 1
+
+    if touched == 0:
+        return raw, "No guild membership found for you to update (fine if you're not in a guild)."
+
+    new_raw = _reserialize_gvas(dumped)
+    return new_raw, (
+        f"Updated your membership in {touched} guild record(s) -- guild name, base "
+        "camp, and every other member left exactly as they were."
+    )
+
+
+def migrate_guild_membership_sync(wsd_src: dict, wsd_dst: dict, old_uid_str: str, target_uid_str: str) -> str:
+    """Best-effort, structurally-verified guild sync for the target player
+    ONLY, for `sync` (a different world on each side, so unlike unhost this
+    sometimes has to invent a new destination entry rather than just
+    relabel one). Three outcomes:
+
+      - Already a guild member on the server (the common case for an
+        already-live server): just refreshes your stored display name in
+        that one row. Nothing else about that guild -- other members,
+        roles, base camp, name -- is touched.
+      - Not a guild member on the server yet, and your single-player save
+        has you in a SOLO guild (just you): recreates that solo guild on
+        the server under a fresh ID, with base-camp references cleared
+        (buildings aren't migrated, so those IDs wouldn't point to
+        anything real on the server).
+      - Not a guild member on the server yet, and your single-player save
+        has you in a guild with other real people in it: skipped --
+        creating that guild on the server would mean inventing state for
+        players sync has no business touching.
+
+    Returns a human-readable one-line summary. Never touches any entry
+    that isn't the target player's own."""
+    ok, reason = palgroup.verify_group_map_roundtrip(wsd_dst)
+    if ok:
+        ok, reason = palgroup.verify_group_map_roundtrip(wsd_src)
+    if not ok:
+        return f"Guild membership left untouched -- {reason}, so this was skipped for safety."
+
+    old_tuple = palgroup.uid_str_to_tuple(old_uid_str)
+    target_tuple = palgroup.uid_str_to_tuple(target_uid_str)
+
+    # Find the target player's own membership (if any) in the source save,
+    # and their stored display name there.
+    src_entry = None
+    src_gd = None
+    for entry, gt in palgroup.iter_group_entries(wsd_src):
+        if gt not in palgroup.GUILD_TYPES:
+            continue
+        gd = palgroup.GroupData.decode(palgroup.get_raw_data(entry), gt)
+        if old_tuple in gd.player_uids():
+            src_entry, src_gd = entry, gd
+            break
+
+    src_name = None
+    if src_gd is not None:
+        if isinstance(src_gd.variant, palgroup.GuildGroup):
+            for p in src_gd.variant.tail.players:
+                if p.player_uid == old_tuple:
+                    src_name = p.info.player_name
+        elif isinstance(src_gd.variant, palgroup.IndependentGuildGroup):
+            src_name = src_gd.variant.player_name
+
+    # 1) Already a member on the destination -- refresh the display name only.
+    for entry, gt in palgroup.iter_group_entries(wsd_dst):
+        if gt not in palgroup.GUILD_TYPES:
+            continue
+        gd = palgroup.GroupData.decode(palgroup.get_raw_data(entry), gt)
+        if target_tuple not in gd.player_uids():
+            continue
+        changed = False
+        if isinstance(gd.variant, palgroup.GuildGroup):
+            for p in gd.variant.tail.players:
+                if p.player_uid == target_tuple and src_name and p.info.player_name != src_name:
+                    p.info.player_name = src_name
+                    changed = True
+        elif isinstance(gd.variant, palgroup.IndependentGuildGroup):
+            if src_name and gd.variant.player_name != src_name:
+                gd.variant.player_name = src_name
+                changed = True
+        if changed:
+            palgroup.set_raw_data(entry, gd.encode())
+            return "Refreshed your display name in your existing guild membership on the server."
+        return "You're already a guild member on the server -- guild membership left as-is."
+
+    # 2) Not a member yet.
+    if src_gd is None:
+        return "No guild membership found for you in your single-player save -- nothing to sync."
+    member_uids = src_gd.player_uids()
+    if len(member_uids) > 1:
+        return (
+            "You're in a shared guild in your single-player save (with other real "
+            "players in it) -- sync won't create shared guilds on the server, since "
+            "that would mean inventing state for players it has no business touching. "
+            "Join or create a guild normally after connecting instead."
+        )
+    if not isinstance(src_gd.variant, palgroup.GuildGroup):
+        return "Guild membership left untouched (unsupported guild record shape)."
+
+    new_variant = copy.deepcopy(src_gd.variant)
+    new_variant.base_ids = []
+    new_variant.map_object_instance_ids_base_camp_points = []
+    _swap_uid_in_guild_variant(new_variant, old_tuple, target_tuple)
+
+    new_group_id = _fresh_group_id(wsd_src, wsd_dst)
+    new_gd = palgroup.GroupData(
+        group_id=new_group_id,
+        group_name="",
+        individual_character_handle_ids=[],
+        group_type="EPalGroupType::Guild",
+        variant=new_variant,
+    )
+    new_entry = {
+        "key": palgroup.tuple_to_uid_str(new_group_id),
+        "value": {
+            "GroupType": {
+                "id": None,
+                "value": {"type": "EPalGroupType", "value": "EPalGroupType::Guild"},
+                "type": "EnumProperty",
+            },
+            "RawData": {
+                "array_type": "ByteProperty",
+                "id": None,
+                "value": {"values": list(new_gd.encode())},
+                "type": "ArrayProperty",
+            },
+            "CustomVersionData": copy.deepcopy(src_entry["value"]["CustomVersionData"]),
+        },
+    }
+    wsd_dst["GroupSaveDataMap"]["value"].append(new_entry)
+    name_note = f" named {new_variant.guild_name!r}" if new_variant.guild_name else ""
+    return (
+        f"Created a new guild{name_note} on the server for you (base camp references "
+        "cleared -- buildings aren't migrated)."
+    )
 
 
 def _container_ids_from_player(player_dumped: dict) -> tuple[set[str], set[str]]:
@@ -1103,6 +1346,12 @@ def _sync_core(
     )
     _check_no_duplicate_ids(dst_dumped)
 
+    print("Checking guild membership...")
+    wsd_src = src_dumped["properties"]["worldSaveData"]["value"]
+    wsd_dst = dst_dumped["properties"]["worldSaveData"]["value"]
+    guild_msg = migrate_guild_membership_sync(wsd_src, wsd_dst, old_uid_str, target_uid_str)
+    print(f"  {guild_msg}")
+
     print(
         f"\nCharacterSaveParameterMap: replacing {stats.records_removed} stale server "
         f"record(s) with {stats.records_added} fresh one(s) from your single-player save "
@@ -1123,9 +1372,8 @@ def _sync_core(
         for iid in stats.collisions_skipped:
             print(f"    {iid}")
     print(
-        "\nEverything else on the server -- every other player, the guild(s), and all "
-        "placed/built structures -- is untouched: not read, not re-serialized, not "
-        "written."
+        "\nEverything else on the server -- every other player, every other player's "
+        "guild membership, and all placed/built structures -- is untouched."
     )
 
     if not yes:
@@ -1178,7 +1426,9 @@ def perform_sync(
 ) -> Path:
     """Splice a single character's own records from a single-player/co-op
     world into an ALREADY-LIVE, already-populated dedicated server, without
-    touching any other player, the guild(s), or built structures. Use this
+    touching any other player or built structures (your own guild
+    membership row is updated/created -- see migrate_guild_membership_sync
+    -- but no other player's guild data is ever touched). Use this
     instead of `unhost` whenever the destination server already has real
     history -- either for other people, or for you (e.g. you played solo as
     a stopgap and now want to bring that progress back to the shared
@@ -1211,6 +1461,193 @@ def perform_sync(
         "start it back up and reconnect."
     )
     return out_dir
+
+
+# --------------------------------------------------------------------------
+# "backup" -- snapshot a world folder's save files before doing anything
+# risky. Zips Level.sav, LevelMeta.sav, WorldOption.sav, LocalData.sav (if
+# present), and every Players/*.sav -- everything hostfix/optioneditor
+# ever read or write -- into one timestamped archive. Never touches the
+# source folder.
+# --------------------------------------------------------------------------
+def perform_backup(world_dir: Path, out_path: Path | None = None) -> Path:
+    """Zip up world_dir's save files. Returns the path to the zip. Raises
+    HostfixError if world_dir doesn't look like a world folder."""
+    import zipfile
+    from datetime import datetime
+
+    if not (world_dir / "Level.sav").exists():
+        raise HostfixError(f"No Level.sav found in {world_dir} -- is this really a world folder?")
+
+    if out_path is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = world_dir.parent / f"{world_dir.name}_backup_{stamp}.zip"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    files = [
+        world_dir / n for n in ("Level.sav", "LevelMeta.sav", "WorldOption.sav", "LocalData.sav")
+        if (world_dir / n).exists()
+    ]
+    players_dir = world_dir / "Players"
+    if players_dir.is_dir():
+        files += sorted(players_dir.glob("*.sav"))
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=f.relative_to(world_dir))
+
+    return out_path
+
+
+def cmd_backup(args: argparse.Namespace) -> None:
+    try:
+        out = perform_backup(Path(args.world_dir), Path(args.out) if args.out else None)
+    except HostfixError as e:
+        sys.exit(str(e))
+    print(f"Wrote {out}")
+
+
+def _offer_backup(world_dir: Path, label: str = "world folder") -> None:
+    """Used by the interactive wizards, right before a risky write, to
+    offer a one-keystroke safety net. Never raises -- a failed backup is
+    reported and the flow continues, rather than blocking the user's
+    actual task over the backup itself."""
+    if not _prompt_yes_no(f"Back up your {label} first ({world_dir})?", default=True):
+        return
+    try:
+        out = perform_backup(world_dir)
+        print(f"Backed up to {out}\n")
+    except HostfixError as e:
+        print(f"  (backup failed: {e} -- continuing anyway)\n")
+
+
+# --------------------------------------------------------------------------
+# "doctor" -- scan a world folder for problems this project has actually
+# run into, rather than guessing at generic health checks. Read-only:
+# never writes anything.
+# --------------------------------------------------------------------------
+@dataclass
+class DoctorFinding:
+    level: str  # "info" | "warning" | "error"
+    message: str
+
+
+def run_doctor(world_dir: Path, compare_dir: Path | None = None) -> list[DoctorFinding]:
+    """Returns a list of findings. compare_dir, if given, enables a check
+    for the single-player-data-degradation pattern discovered in this
+    project: pass an older backup or the live server's folder to compare
+    per-player reference counts against."""
+    findings: list[DoctorFinding] = []
+
+    level_path = world_dir / "Level.sav"
+    if not level_path.exists():
+        findings.append(DoctorFinding("error", f"No Level.sav found in {world_dir}."))
+        return findings
+
+    # 1. Every key file should decompress and structurally parse cleanly.
+    for name in ("Level.sav", "LevelMeta.sav", "WorldOption.sav"):
+        p = world_dir / name
+        if not p.exists():
+            continue
+        try:
+            sf = SavFile.load(p)
+            _dump_gvas(sf.raw_gvas)
+        except Exception as e:
+            findings.append(DoctorFinding("error", f"{name} doesn't parse cleanly: {e}"))
+    players_dir = world_dir / "Players"
+    if players_dir.is_dir():
+        for pf in sorted(players_dir.glob("*.sav")):
+            try:
+                sf = SavFile.load(pf)
+                _dump_gvas(sf.raw_gvas)
+            except Exception as e:
+                findings.append(DoctorFinding("error", f"Players/{pf.name} doesn't parse cleanly: {e}"))
+        if not any(f.level == "error" for f in findings):
+            # 2. Duplicate IDs in Level.sav (see _check_no_duplicate_ids's
+            # docstring -- sync guards against this at write time, but a
+            # save edited by something else entirely could still have it).
+            try:
+                level = SavFile.load(level_path)
+                _, dumped = _dump_gvas(level.raw_gvas)
+                _check_no_duplicate_ids(dumped)
+            except HostfixError as e:
+                findings.append(DoctorFinding("error", str(e)))
+            except Exception as e:
+                findings.append(DoctorFinding(
+                    "warning", f"Couldn't fully check Level.sav for duplicate IDs: {e}"
+                ))
+
+    # 3. WorldOption.sav / PalWorldSettings.ini precedence reminder -- see
+    # optioneditor.py's export_ini() module comment for the full story.
+    if (world_dir / "WorldOption.sav").exists():
+        findings.append(DoctorFinding(
+            "info",
+            "WorldOption.sav is present. On a dedicated server this takes priority over "
+            "PalWorldSettings.ini for most gameplay settings -- but server identity/network "
+            "settings (ServerName, ServerPassword, PublicPort, bIsMultiplay, etc.) are always "
+            "read from the ini regardless. If a setting you changed isn't taking effect, see "
+            "optioneditor.py's export-ini command."
+        ))
+
+    # 4. Optional: compare owned-Pal reference counts against another
+    # world folder to catch the single-player data-degradation pattern
+    # discovered in this project (see the README's Limitations section).
+    # Deliberately does NOT limit this to players who have their own
+    # Players/*.sav file in world_dir -- that's exactly what a
+    # single-player save lacks for the other, non-connectable players
+    # who are the ones this check needs to catch. Instead it measures raw
+    # reference counts directly against Level.sav for every player UID
+    # known from EITHER folder's Players/ listing, the same way the
+    # degradation was originally discovered.
+    if compare_dir is not None:
+        compare_level_path = compare_dir / "Level.sav"
+        if not compare_level_path.exists():
+            findings.append(DoctorFinding("error", f"No Level.sav found in --compare folder {compare_dir}."))
+        else:
+            level_a = SavFile.load(level_path)
+            level_b = SavFile.load(compare_level_path)
+            _, infos_a = scan_players(world_dir, quiet=True)
+            _, infos_b = scan_players(compare_dir, quiet=True)
+            all_uids = sorted({i.guid_str for i in infos_a} | {i.guid_str for i in infos_b})
+            for guid_str in all_uids:
+                raw_uid = guid_str_to_raw(guid_str)
+                count_a = level_a.raw_gvas.count(raw_uid)
+                count_b = level_b.raw_gvas.count(raw_uid)
+                if count_b == 0:
+                    continue
+                if count_a == 0:
+                    findings.append(DoctorFinding(
+                        "warning",
+                        f"Player {guid_str}: had {count_b} reference(s) in {compare_dir} but "
+                        f"none at all in {world_dir}. If this is your OWN real server ID and "
+                        "you're currently playing single-player under a different ID (e.g. the "
+                        "single-player host ID), that's expected, not a problem -- otherwise, "
+                        "this player's data doesn't appear to be present in this save at all."
+                    ))
+                elif count_a < count_b * 0.5:
+                    findings.append(DoctorFinding(
+                        "warning",
+                        f"Player {guid_str}: reference count dropped from {count_b} "
+                        f"(in {compare_dir}) to {count_a} (in {world_dir}) -- more than 50% "
+                        "lower. This doesn't say why -- it could be intentional cleanup, a "
+                        "different tool's edit, or (the pattern this check was originally built "
+                        "for) a single-player save silently degrading a non-connectable "
+                        "player's data over time. Worth a manual look before this data is "
+                        "pushed anywhere, but if you did this on purpose, ignore it."
+                    ))
+
+    if not findings:
+        findings.append(DoctorFinding("info", "No problems found."))
+    return findings
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    findings = run_doctor(Path(args.world_dir), Path(args.compare) if args.compare else None)
+    icons = {"error": "[ERROR]", "warning": "[WARN] ", "info": "[INFO] "}
+    for f in findings:
+        print(f"{icons.get(f.level, '  ')} {f.message}")
+    if any(f.level == "error" for f in findings):
+        sys.exit(1)
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
@@ -1393,6 +1830,8 @@ def run_interactive() -> None:
     )
 
     print()
+    _offer_backup(world_dir, "SOURCE world folder")
+    print()
     try:
         perform_migration(
             world_dir=world_dir,
@@ -1504,6 +1943,9 @@ def run_interactive_unhost() -> None:
     target = server_infos[server_choice]
     print(f"\nTarget dedicated-server ID: {target.guid_str}  (Players/{target.path.name})\n")
 
+    _offer_backup(server_dir, "SERVER save folder (the one you're about to overwrite)")
+    print()
+
     default_out = str(world_dir.parent / (world_dir.name + "_dedicated"))
     out_dir_str = _prompt("Where should the server-ready save be written?", default=default_out)
     out_dir = Path(_clean_path_input(out_dir_str))
@@ -1546,9 +1988,10 @@ def run_interactive_sync() -> None:
         "Use this instead of the 'unhost' option when your dedicated server ISN'T "
         "brand new -- i.e. it already has real progress for you and/or other people. "
         "A whole-world push (what 'unhost' does) would blow away that history; this "
-        "instead surgically updates only YOUR character, your owned Pals, and your "
-        "personal containers (inventory/equipment/party/Palbox) -- every other "
-        "player, the guild(s), and built structures are left completely untouched.\n"
+        "instead surgically updates only YOUR character, your owned Pals, your "
+        "personal containers (inventory/equipment/party/Palbox), and your own guild "
+        "membership -- every other player, every other player's guild data, and "
+        "built structures are left completely untouched.\n"
     )
 
     world_dir = _prompt_world_folder(
@@ -1599,6 +2042,9 @@ def run_interactive_sync() -> None:
     target = server_infos[server_choice]
     print(f"\nTarget dedicated-server ID: {target.guid_str}  (Players/{target.path.name})\n")
 
+    _offer_backup(server_dir, "SERVER save folder (the one you're about to overwrite)")
+    print()
+
     default_out = str(server_dir.parent / (server_dir.name + "_synced"))
     out_dir_str = _prompt("Where should the updated server save be written?", default=default_out)
     out_dir = Path(_clean_path_input(out_dir_str))
@@ -1621,6 +2067,48 @@ def run_interactive_sync() -> None:
         print(f"\nSomething went wrong:\n  {e}")
     except MigrationAborted:
         print("\nAborted, nothing was written.")
+
+
+def run_interactive_backup() -> None:
+    print("=" * 70)
+    print(" palworld-oodle-hostfix -- backup")
+    print("=" * 70)
+    print()
+    world_dir = _prompt_world_folder(
+        "Path to the world folder to back up (the one with Level.sav in it -- "
+        "you can paste or drag-and-drop it here)"
+    )
+    default_out = str(world_dir.parent / f"{world_dir.name}_backup.zip")
+    out_str = _prompt("Write the backup zip to", default=default_out)
+    out_path = Path(_clean_path_input(out_str))
+    try:
+        out = perform_backup(world_dir, out_path)
+        print(f"\nWrote {out}")
+    except HostfixError as e:
+        print(f"\nSomething went wrong:\n  {e}")
+
+
+def run_interactive_doctor() -> None:
+    print("=" * 70)
+    print(" palworld-oodle-hostfix -- doctor")
+    print(" Scan a world folder for known problems/gotchas")
+    print("=" * 70)
+    print()
+    world_dir = _prompt_world_folder(
+        "Path to the world folder to check (the one with Level.sav in it -- "
+        "you can paste or drag-and-drop it here)"
+    )
+    compare_str = _prompt(
+        "Also compare against another world folder (an older backup, or the live "
+        "server) to check for missing/degraded player data? Leave blank to skip",
+        default="",
+    )
+    compare_dir = Path(_clean_path_input(compare_str)) if compare_str else None
+    print()
+    findings = run_doctor(world_dir, compare_dir)
+    icons = {"error": "[ERROR]", "warning": "[WARN] ", "info": "[INFO] "}
+    for f in findings:
+        print(f"{icons.get(f.level, '  ')} {f.message}\n")
 
 
 def main() -> None:
@@ -1723,6 +2211,25 @@ def main() -> None:
     p_sync.add_argument("--out", default=None, help="Output folder (default: <server_dir>_synced)")
     p_sync.add_argument("-y", "--yes", action="store_true", help="Don't ask for confirmation")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_backup = sub.add_parser(
+        "backup", help="Zip up a world folder's save files before doing anything risky"
+    )
+    p_backup.add_argument("world_dir", help="Path to the world folder (contains Level.sav)")
+    p_backup.add_argument(
+        "--out", default=None,
+        help="Output zip path (default: <world_dir>_backup_<timestamp>.zip next to it)",
+    )
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_doctor = sub.add_parser("doctor", help="Scan a world folder for known problems/gotchas")
+    p_doctor.add_argument("world_dir", help="Path to the world folder (contains Level.sav)")
+    p_doctor.add_argument(
+        "--compare", default=None,
+        help="Also compare per-player reference counts against another world folder (e.g. "
+        "an older backup or the live server) to catch single-player data degradation",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
     args.func(args)

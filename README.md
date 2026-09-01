@@ -9,20 +9,35 @@ Two small tools for Palworld saves using the newer **Oodle-compressed
     level, stats, inventory, unlocked tech, owned Pals, guild membership,
     built structures, and fast-travel/map reveal progress intact.
   - **unhost**: single-player/co-op -> a fresh, never-joined dedicated
-    server, keeping their level, stats, inventory, unlocked tech, and
-    owned Pals intact (guild membership and built structures are a known
+    server, keeping their level, stats, inventory, unlocked tech, owned
+    Pals, and guild membership intact (built structures are a known
     limitation for this direction specifically -- see below).
   - **sync**: single-player/co-op -> an **already-live, already-populated**
     dedicated server. Use this instead of `unhost` whenever the server
     already has real progress for you and/or other people -- it updates
-    only your own character, owned Pals, and personal inventory/equipment,
-    and never touches anyone else, the guild(s), or built structures (see
-    below for why this needs a different technique than `unhost`).
+    only your own character, owned Pals, personal inventory/equipment, and
+    your own guild membership, and never touches anyone else, anyone
+    else's guild data, or built structures (see below for why this needs a
+    different technique than `unhost`).
+  - **backup**: zip up a world folder's save files (Level.sav,
+    LevelMeta.sav, WorldOption.sav, LocalData.sav, every Players/*.sav)
+    into one timestamped archive. Also offered automatically by the
+    `unhost`/`sync` wizards right before they'd touch anything.
+  - **doctor**: scan a world folder for problems this project has
+    actually run into -- files that don't decompress/parse cleanly,
+    duplicate IDs, a `WorldOption.sav` silently overriding settings you
+    just changed in the ini, and (with `--compare`) player data that's
+    missing or dropped sharply compared to another folder (an older
+    backup, or the live server).
 - **optioneditor** — edit a world's settings (`WorldOption.sav`):
   difficulty, day/night speed, every XP/damage/drop-rate slider, PvP and
   multiplayer toggles, and (for a dedicated server) the server
   name/password/ports/etc. Handy for tuning a world after migrating it
-  with hostfix, or any time.
+  with hostfix, or any time. Includes small bundled presets
+  (casual/normal/hard/pvp/pve) to change a handful of related settings in
+  one step, and can export a `WorldOption.sav`'s settings into a real
+  `PalWorldSettings.ini` for the fields a dedicated server only ever reads
+  from there.
 
 ## The problem this solves
 
@@ -94,9 +109,12 @@ That gives you a choice of the tools:
       (hostfix unhost -- for a BRAND NEW server; see Limitations)
   [3] Update your character on an ALREADY-LIVE dedicated server
       (hostfix sync -- safe when the server already has real progress for
-       you and/or others; never touches other players, the guild, or builds)
+       you and/or others; updates your own guild membership too, but never
+       touches other players, their guild data, or built structures)
   [4] Edit world settings (WorldOption.sav)
       (optioneditor -- difficulty, rates, PvP, server settings, etc.)
+  [5] Back up a world folder's save files
+  [6] Check a world folder for known problems
   [0] Exit
 ```
 
@@ -231,11 +249,13 @@ player's data with your solo save's (possibly stale, or even
 degraded -- see the note linked above) copy of them.
 
 `sync` instead surgically updates **only your own stuff**: your character
-record, every Pal you currently own, and your personal containers
-(inventory, equipped gear, party, Palbox). It parses both worlds properly
-rather than doing a raw byte patch, so it can add and remove entries
-cleanly -- and it never even opens the guild or building data, so those
-are guaranteed byte-for-byte untouched no matter what.
+record, every Pal you currently own, your personal containers (inventory,
+equipped gear, party, Palbox), and your own guild membership. It parses
+both worlds properly rather than doing a raw byte patch, so it can add and
+remove entries cleanly -- and it never even opens anyone else's guild
+data, so every other player's guild is guaranteed byte-for-byte untouched
+no matter what. Placed/built structures aren't migrated either way (see
+the Limitations section).
 
 From the menu, pick option `[3]`:
 
@@ -259,13 +279,16 @@ Which one is you on the server? [1-5]: 1
 
 Where should the updated server save be written? [.../WorldGUID_synced]:
 
+Checking guild membership...
+  You're already a guild member on the server -- guild membership left as-is.
+
 CharacterSaveParameterMap: replacing 1 stale server record(s) with 68 fresh one(s) from
 your single-player save (your character + every Pal you currently own).
 Containers: replacing 6 item container(s) (inventory/equipment) and 2 character
 container(s) (party/Palbox).
 
-Everything else on the server -- every other player, the guild(s), and all
-placed/built structures -- is untouched: not read, not re-serialized, not written.
+Everything else on the server -- every other player, every other player's guild
+membership, and all placed/built structures -- is untouched.
 
 Proceed and write the updated server save? [y/N] y
 ```
@@ -290,7 +313,66 @@ Once it's done, copy the output folder's contents **over** your dedicated
 server's save folder, same as `unhost` -- make sure the server is fully
 stopped first.
 
-#### 4) optioneditor — edit world settings
+#### Guild membership in `sync`
+
+Three outcomes, depending on what's already there:
+
+- You're already a guild member on the server (the common case) -- your
+  stored display name in that one row is refreshed if it's changed; the
+  guild's name, base camp, roles, and every other member are left exactly
+  as they were.
+- You're not a guild member on the server yet, and your single-player
+  guild is just you (a solo guild) -- a new guild is created on the server
+  for you under a fresh ID, keeping your guild's name but with base camp
+  references cleared (buildings aren't migrated, so those IDs wouldn't
+  point to anything real on the server).
+- You're not a guild member on the server yet, and your single-player
+  guild has other real people in it -- skipped, with a message telling you
+  so. Creating that guild on the server would mean inventing state for
+  players `sync` has no business touching; join or create a guild normally
+  after connecting instead.
+
+#### 4) hostfix backup / doctor — safety net and health check
+
+Two small, read-mostly helpers that don't fit either migration direction:
+
+**backup** (option `[5]`) zips up a world folder's save files -- `Level.sav`,
+`LevelMeta.sav`, `WorldOption.sav`, `LocalData.sav`, and every
+`Players/*.sav` -- into one timestamped archive next to the folder, without
+touching the original. The `unhost` and `sync` wizards also offer this
+automatically right before they'd write anything to your source or server
+folder, so you don't have to remember to run it separately in the normal
+flow -- this option is for backing something up on its own (e.g. before
+using a different tool entirely, or just as a habit).
+
+**doctor** (option `[6]`) scans a world folder for problems this project
+has actually run into: files that don't decompress or structurally parse
+cleanly, duplicate `InstanceId`/container IDs, and a `WorldOption.sav`
+that's present (a reminder about the ini-precedence gotcha above). Point
+it at a second folder -- an older backup, or the live server -- and it'll
+also flag any player whose data is missing or has dropped sharply between
+the two:
+
+```
+Path to the world folder to check (...): C:\...\PalServer\...\SaveGames\0\WorldGUID
+Also compare against another world folder (...)? Leave blank to skip: C:\...\backup\world\2026.08.29-01.28.59
+
+[WARN]  Player bbbbbbbb-0000-0000-0000-000000000000: had 1755 reference(s) in
+.../backup/world/2026.08.29-01.28.59 but none at all in .../WorldGUID. If this
+is your OWN real server ID and you're currently playing single-player under a
+different ID (e.g. the single-player host ID), that's expected, not a problem
+-- otherwise, this player's data doesn't appear to be present in this save at
+all.
+```
+
+This doesn't diagnose *why* -- a player's data can go missing from
+intentional cleanup with a different tool, an accidental copy of the wrong
+folder, or the single-player degradation pattern this check was originally
+built to catch (see [Limitations](#why-single-player-mode-is-a-bad-long-term-substitute-for-a-shut-down-server))
+-- it just tells you something changed so you can decide whether that's
+expected before pushing this data anywhere further.
+
+#### 5) optioneditor — edit world settings
 
 Point it at a `WorldOption.sav` (the migrated one from step 1, or any
 world's) and pick a category, then a setting, then type a new value:
@@ -334,6 +416,40 @@ the handful of dropdown-style settings (`Difficulty`, `DeathPenalty`,
 `LogFormatType`, `RandomizerType`) show you the valid choices and reject
 anything else so you can't accidentally save a value the game won't
 understand.
+
+#### Presets
+
+Pick **`[P]`** from the category screen to apply a small bundle of
+related settings in one step instead of changing them individually:
+
+```
+  [P] Apply a bundled preset (casual/normal/hard/pvp/pve)
+
+Available presets:
+  [1] casual  -- Easier survival -- faster leveling, generous captures, no permanent death penalty.
+  [2] normal  -- The game's own default difficulty-related values.
+  [3] hard  -- Tougher survival -- slower leveling, stingier captures, lose equipment on death.
+  [4] pvp  -- Turns on player-vs-player combat and related toggles. Doesn't change PvE rates.
+  [5] pve  -- Turns player-vs-player combat off (the usual choice for a co-op-focused server).
+
+Applied 'casual' (4 field(s) changed, not saved yet):
+  Difficulty: Custom -> Casual
+  ExpRate: 5.0 -> 2.0
+  DeathPenalty: Item -> None
+  bEnableInvaderEnemy: true -> false
+```
+
+These are deliberately small, targeted bundles -- a handful of fields
+each, not a full rewrite of every setting -- so the diff is easy to
+review, and nothing's saved until you go through the normal save prompt
+afterward. Applying one is a starting point, not a final answer: check
+the categories afterward and adjust anything you'd rather set
+differently before saving. From the CLI:
+
+```
+python optioneditor.py apply-preset --list
+python optioneditor.py apply-preset /path/to/WorldOption.sav casual
+```
 
 #### Turning WorldOption.sav into a PalWorldSettings.ini
 
@@ -431,6 +547,16 @@ python hostfix.py sync /path/to/single_player_world_folder \
 
 `--old-uid` defaults to the single-player host ID, same as `unhost`. Run
 `python hostfix.py sync --help` for the full flag list.
+
+**backup** / **doctor**:
+
+```
+python hostfix.py backup /path/to/world_folder
+# -> writes world_folder_backup_<timestamp>.zip next to it
+
+python hostfix.py doctor /path/to/world_folder
+python hostfix.py doctor /path/to/world_folder --compare /path/to/an/older/backup_or_the_live_server
+```
 
 **optioneditor** — inspect or change one setting at a time:
 
@@ -546,10 +672,12 @@ file, `LevelMeta.sav`, or `WorldOption.sav` are touched or written, since
   `scoped_unhost_swap` function in `hostfix.py` for the full technique if
   you're curious.
 - Because of that, it only migrates what it can safely verify: your
-  character's own record and every Pal you currently own (level, stats,
-  inventory, unlocked tech, and Pals are all covered). Guild membership
-  and any structures you'd built are **not** migrated by this direction —
-  see Limitations below.
+  character's own record, every Pal you currently own (level, stats,
+  inventory, unlocked tech, and Pals are all covered), and your guild
+  membership (see `palgroup.py` — a real, decodable structure, just not
+  the one `palworld-save-tools` ships a working decoder for anymore).
+  Structures you'd built are **not** migrated by this direction — see
+  Limitations below.
 - Same before-writing byte-count verification as `migrate`.
 
 **hostfix sync (single-player/co-op -> an already-live dedicated server):**
@@ -565,10 +693,13 @@ file, `LevelMeta.sav`, or `WorldOption.sav` are touched or written, since
   `CharacterContainerSaveData` entries (matched by container ID read
   cleanly off each side's own `Players/<uid>.sav`, which is not opaque the
   way the map's `RawData` blobs are).
-- Every other player, `GroupSaveDataMap` (guild), and `MapObjectSaveData`
-  (buildings) in the destination are never even inspected for changes —
-  verified on real production data to come out byte-for-byte /
-  structurally identical before and after a sync.
+- Every other player and `MapObjectSaveData` (buildings) in the
+  destination are never even inspected for changes — verified on real
+  production data to come out byte-for-byte / structurally identical
+  before and after a sync. `GroupSaveDataMap` (guild) gets one narrow,
+  separate pass that only ever touches the target player's own row, or
+  adds one brand-new entry for them — see "Guild membership in `sync`"
+  above.
 - If a Pal being added from your single-player save shares an `InstanceId`
   with something already present in the destination under someone (or
   something) else, it's skipped and reported rather than duplicated or
@@ -599,16 +730,24 @@ edit binary save file internals; that's inherently not risk-free.
   cases (this is a known rough edge in every tool that does this kind of
   migration, not specific to this one) — if your base/guild doesn't look
   right after loading, that's the most likely place to check.
-- **`unhost` does not migrate guild membership or placed/built
-  structures at all.** Unlike `migrate`, the ID it moves away from by
-  default is low-entropy enough that even a search scoped to one guild's
-  or one building's own data is unreliable (measured: 94% false-positive
-  matches for buildings, 78% for guild data, on real test data) — there's
-  no way to do it safely with the raw-byte technique this tool relies on.
-  Your character, their level/stats/inventory/tech, and every Pal they
-  own all transfer over fine; you'll likely need to create or rejoin a
-  guild, and rebuild or reclaim (via server admin commands, if your host
-  supports them) any base you'd already built, on the new server.
+- **Neither `unhost` nor `sync` migrates placed/built structures
+  (`MapObjectSaveData`).** This one's a harder wall than the old blanket
+  "guild + buildings" limitation used to suggest: guild membership turned
+  out to have a real, decodable structure (see `palgroup.py`, and "Guild
+  membership in `sync`" above) once we stopped relying on
+  `palworld-save-tools`' own bundled decoder for it (which is stale
+  against the current save format and throws on every real guild record
+  tested). Buildings don't have the same escape hatch — parsing
+  `MapObjectSaveData` against real save data fails outright ("Warning: EOF
+  not reached"), and even the actively-maintained reference
+  implementation this project's guild decoder is ported from treats that
+  field as routinely liable to fail to parse and falls back to raw bytes
+  per object rather than promising a clean decode. There's no reliable way
+  to migrate structure ownership right now. Your character, their
+  level/stats/inventory/tech, every Pal they own, and (as of this version)
+  guild membership all transfer over fine; you'll likely need to rebuild
+  or reclaim (via server admin commands, if your host supports them) any
+  base you'd already built, on the new server.
 - `LocalData.sav` is copied through opaquely (see above) — if your game
   version's internal layout for it ever changes in a way that breaks this,
   hostfix will print a warning and fall back to a raw file copy rather
