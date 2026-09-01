@@ -3,10 +3,18 @@
 palworld-oodle-hostfix
 ======================
 
-Migrate a Palworld *dedicated server* character (and everything tied to
-them: owned Pals, guild membership, placed/painted building pieces) into
-a *single-player / co-op host* save, keeping their level, inventory, and
-world progress intact.
+Migrate a Palworld character between a *dedicated server* save and a
+*single-player / co-op host* save, in either direction:
+
+- `migrate`: dedicated server -> single-player/co-op. Moves everything
+  tied to the character (owned Pals, guild membership, placed/painted
+  building pieces), keeping their level, inventory, and world progress
+  intact.
+- `unhost`: single-player/co-op -> a fresh dedicated server. Moves the
+  character's level, inventory, and owned Pals; guild membership and
+  built structures are a known limitation for this direction specifically
+  (see scoped_unhost_swap()'s docstring/comment in this file, and the
+  README's Limitations section, for why).
 
 Why this exists
 ----------------
@@ -33,16 +41,23 @@ This tool sidesteps both problems:
    legitimately* everywhere that ID is referenced: the character map key,
    every Pal's OwnerPlayerUId/OldOwnerPlayerUIds/nickname-modifier field,
    every guild membership record, and every placed-building's builder
-   tag. A single scoped find-and-replace of that 16-byte pattern (verified
-   byte-for-byte before writing) reassigns literally everything that ID
-   touches in one pass, without needing to understand the surrounding
-   struct at all. Always writes back in the classic zlib ``PlZ`` format,
-   which Palworld happily reads on any platform.
+   tag. For `migrate`, a single scoped find-and-replace of that 16-byte
+   pattern (verified byte-for-byte before writing) reassigns literally
+   everything that ID touches in one pass, without needing to understand
+   the surrounding struct at all -- safe because that ID's 4 random bytes
+   make a coincidental false match astronomically unlikely. `unhost`
+   moves the *other* way, usually away from the special, low-entropy
+   single-player host ID, for which that same blind approach turns out to
+   be unsafe (see scoped_unhost_swap() below) -- it uses structural
+   verification instead, at the cost of not being able to safely cover
+   guild/building data. Always writes back in the classic zlib ``PlZ``
+   format, which Palworld happily reads on any platform.
 
 This was built and validated against a real dedicated-server world with
 ~1900 real references to a single player ID scattered across Pals, a
 guild, and base structures -- all of which correctly reassigned to the
-new ID with a single global replace, verified by an exact expected-vs-
+new ID with a single global replace (for `migrate`) or a structurally-
+verified scoped replace (for `unhost`), verified by an exact expected-vs-
 actual differing-byte-count check before ever writing a file.
 
 Requirements
@@ -65,10 +80,16 @@ Usage
     python hostfix.py migrate /path/to/world_folder --old-uid ... \\
         --out ... --world-name "MyWorld"
 
+    # Or the reverse: prep a single-player/co-op world to seed a fresh
+    # dedicated server (see the README's Limitations section first).
+    python hostfix.py unhost /path/to/single_player_world_folder \\
+        --out /path/to/single_player_world_folder_dedicated
+
 Then copy the output folder's contents into your local
-``...\\Pal\\Saved\\SaveGames\\<YourSteamID>\\<WorldGUID>\\`` (create the
-WorldGUID folder if it doesn't already exist -- the name doesn't matter,
-Palworld reads whatever's in there).
+``...\\Pal\\Saved\\SaveGames\\<YourSteamID>\\<WorldGUID>\\`` (`migrate`) or
+your dedicated server's ``...\\Pal\\Saved\\SaveGames\\0\\<WorldGUID>\\``
+(`unhost`) -- create the ``WorldGUID`` folder if it doesn't already exist,
+the name doesn't matter, Palworld reads whatever's in there.
 
 License: MIT. Use at your own risk -- this edits game save files.
 ALWAYS keep a backup of your original save before running this.
@@ -79,6 +100,7 @@ import argparse
 import contextlib
 import io
 import json
+import secrets
 import shutil
 import sys
 from dataclasses import dataclass
@@ -270,6 +292,13 @@ def print_player_table(infos: list[PlayerInfo], numbered: bool = False) -> None:
         indent = "      " if numbered else "    "
         print(f"{indent}file: Players/{info.path.name}  ({info.size_bytes:,} bytes)")
         print(f"{indent}referenced {info.occurrences} time(s) in Level.sav")
+        if info.is_singleplayer_host:
+            print(
+                f"{indent}(this is a rough, unverified count -- the single-player host ID's "
+                f"raw bytes happen to coincidentally\n{indent} match a lot of unrelated "
+                f"padding elsewhere in the file; 'unhost' uses a much more precise, "
+                f"structurally-verified\n{indent} count before actually changing anything)"
+            )
         print(f"{indent}best-effort name guess: {info.name_guess or '(none found)'}")
         print()
 
@@ -302,27 +331,204 @@ class MigrationAborted(Exception):
     """User answered 'no' at the confirmation prompt."""
 
 
-def perform_migration(
+# --------------------------------------------------------------------------
+# Safe scoped UID swap -- used by the reverse ("unhost") direction
+#
+# perform_migration's blind whole-file replace_uid_everywhere() above is
+# safe *specifically* because a dedicated-server player ID has 4 fully
+# random bytes (~4 billion possible values) -- across a save file with
+# hundreds of thousands of unrelated 16-byte fields, the odds of a
+# coincidental false match are astronomically low.
+#
+# `unhost` defaults to moving *away from* the special single-player host
+# ID (00000000-0000-0000-0000-000000000001), whose raw bytes are almost
+# entirely zero. That exact pattern coincidentally appears thousands of
+# times throughout a real save purely because all-zero byte runs are
+# extremely common padding -- verified empirically against a real ~47MB
+# world file: 18,645 coincidental matches for this pattern, even in a
+# save that had never had anything to do with single-player mode. Blindly
+# replacing every occurrence would silently corrupt thousands of
+# unrelated Pals, items, and containers.
+#
+# So instead of a blind file-wide replace, this only ever touches byte
+# ranges it can *structurally* verify really are the target ID:
+#
+#   1. Clean StructProperty(Guid) fields anywhere in the file (the
+#      CharacterSaveParameterMap key's PlayerUId, the player's own
+#      PlayerUId/IndividualId.PlayerUId, etc.) are found via the exact
+#      byte layout Unreal uses to serialize one: a "Guid\x00" struct-type
+#      marker, then a 16-byte struct-id (usually zero) and a 1-byte "has
+#      property guid" flag, and only *then* the real 16-byte value -- the
+#      value always starts exactly 22 bytes after the marker. This is
+#      entirely independent of the target ID's entropy: it only trusts
+#      bytes at a fixed structural offset from a specific, high-entropy
+#      5-byte ASCII marker, never a blind search for the target pattern.
+#   2. CharacterSaveParameterMap entries that are structurally confirmed
+#      -- by parsing the map, not by pattern-matching -- to be keyed to
+#      the target player are additionally scanned within their own
+#      RawData blob only (never the whole file), for extra coverage of
+#      fields the game doesn't re-serialize with type info.
+#
+# Guild membership (GroupSaveDataMap) and placed-building ownership
+# (MapObjectSaveData) store their references inside a different, fully
+# opaque, game-custom binary encoding with no structural landmark at all.
+# Verified empirically that even scoping a blind search to one guild's or
+# one building's own small RawData blob still produces a large majority
+# of false positives for this specific low-entropy ID (94% false for
+# buildings, 78% false for guild data, measured on a real world save).
+# There's no reliable way to migrate those two for the low-entropy case,
+# so `unhost` deliberately leaves them untouched rather than guess -- see
+# the note printed after a successful run.
+# --------------------------------------------------------------------------
+_GUID_MARKER = b"Guid\x00"
+_GUID_VALUE_OFFSET = len(_GUID_MARKER) + 16 + 1  # + struct_id(16) + has-property-guid flag(1)
+
+
+def _find_structural_guid_offsets(raw: bytes, target_uid: bytes) -> list[int]:
+    """Return every absolute offset in `raw` where a genuine, structurally
+    verified StructProperty(Guid)'s *value* equals target_uid. Entropy-
+    independent: driven by the high-entropy "Guid\\x00" type marker, never
+    by searching for target_uid itself."""
+    offsets = []
+    start = 0
+    while True:
+        idx = raw.find(_GUID_MARKER, start)
+        if idx == -1:
+            break
+        value_pos = idx + _GUID_VALUE_OFFSET
+        if raw[value_pos : value_pos + 16] == target_uid:
+            offsets.append(value_pos)
+        start = idx + 1
+    return offsets
+
+
+def _character_map_owned_rawdata_offsets(raw: bytes, old_uid_str: str, old_uid: bytes) -> list[int]:
+    """Parse CharacterSaveParameterMap, find every entry structurally
+    keyed to old_uid_str (a player's own record, or a Pal they currently
+    own), and scan *only that entry's own RawData blob* for additional
+    occurrences of old_uid not already covered by the marker-based sweep.
+    Raises HostfixError rather than guessing if a blob's position in the
+    file can't be uniquely and safely located."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        from palworld_save_tools.gvas import GvasFile
+        from palworld_save_tools.paltypes import PALWORLD_TYPE_HINTS
+
+        gvas = GvasFile.read(raw, PALWORLD_TYPE_HINTS, {}, allow_nan=True)
+        dumped = gvas.dump()
+
+    offsets: list[int] = []
+    try:
+        csm = dumped["properties"]["worldSaveData"]["value"]["CharacterSaveParameterMap"]["value"]
+    except (KeyError, TypeError):
+        return offsets
+
+    for entry in csm:
+        try:
+            key_uid = entry["key"]["PlayerUId"]["value"]
+        except (KeyError, TypeError):
+            continue
+        if key_uid != old_uid_str:
+            continue
+        raw_data = entry.get("value", {}).get("RawData", {}).get("value", {}).get("values")
+        if not raw_data:
+            continue
+        blob = bytes(raw_data)
+        if old_uid not in blob:
+            continue
+        if raw.count(blob) != 1:
+            raise HostfixError(
+                "Could not safely locate one of your character/Pal records in the "
+                "save file (its data isn't byte-unique) -- refusing to guess rather "
+                "than risk touching the wrong one. Please open an issue with this save."
+            )
+        base = raw.find(blob)
+        local_start = 0
+        while True:
+            i = blob.find(old_uid, local_start)
+            if i == -1:
+                break
+            offsets.append(base + i)
+            local_start = i + 1
+    return offsets
+
+
+def scoped_unhost_swap(raw: bytes, old_uid_str: str, new_uid_str: str) -> tuple[bytes, int]:
+    """Safely reassign old_uid_str -> new_uid_str within a raw .sav's
+    decompressed GVAS bytes, WITHOUT a blind whole-file replace (see the
+    module comment above for why that's unsafe for the low-entropy IDs
+    this is meant for). Returns (new_raw, n) where n is the number of
+    distinct byte positions changed. Raises HostfixError rather than
+    guessing if anything can't be safely verified."""
+    old_uid = guid_str_to_raw(old_uid_str)
+    new_uid = guid_str_to_raw(new_uid_str)
+
+    edits: dict[int, bytes] = {}
+    for off in _find_structural_guid_offsets(raw, old_uid):
+        edits[off] = new_uid
+    for off in _character_map_owned_rawdata_offsets(raw, old_uid_str, old_uid):
+        edits.setdefault(off, new_uid)
+
+    if not edits:
+        return raw, 0
+
+    new_raw = bytearray(raw)
+    for off, val in edits.items():
+        new_raw[off : off + 16] = val
+    new_raw = bytes(new_raw)
+
+    n = len(edits)
+    diff_per_edit = sum(1 for a, b in zip(old_uid, new_uid) if a != b)
+    expected_diff_bytes = n * diff_per_edit
+    actual_diff_bytes = sum(1 for a, b in zip(raw, new_raw) if a != b)
+    if actual_diff_bytes != expected_diff_bytes:
+        raise HostfixError(
+            f"INTERNAL SANITY CHECK FAILED: expected exactly {expected_diff_bytes} "
+            f"differing bytes from {n} scoped edits, got {actual_diff_bytes}. Refusing "
+            "to write a file that didn't verify cleanly -- please open an issue with this save."
+        )
+    return new_raw, n
+
+
+def generate_random_server_uid(world_dir: Path) -> str:
+    """Generates a dedicated-server-shaped player UID (XXXXXXXX-0000-0000-
+    0000-000000000000, matching the shape Palworld's own dedicated servers
+    hand out) that doesn't collide with any player already present in
+    world_dir's Players/ folder, for use as the --new-uid when converting a
+    single-player/co-op world into a fresh dedicated server."""
+    existing = set()
+    players_dir = world_dir / "Players"
+    if players_dir.exists():
+        for pf in players_dir.glob("*.sav"):
+            if UID_HEX_RE.match(pf.stem):
+                existing.add(filename_uid_to_guid_str(pf.stem))
+    for _ in range(1000):
+        prefix = secrets.token_hex(4)
+        if prefix == "00000000":
+            continue
+        candidate = f"{prefix}-0000-0000-0000-000000000000"
+        if candidate not in existing:
+            return candidate
+    raise HostfixError("Could not generate a non-colliding player UID -- this should never happen.")
+
+
+def _migrate_core(
     world_dir: Path,
     old_uid_str: str,
-    new_uid_str: str | None = None,
-    out_dir: Path | None = None,
-    world_name: str | None = None,
-    force: bool = False,
-    yes: bool = False,
-) -> Path:
-    """Core migration logic, shared by the `migrate` CLI command and the
-    interactive wizard. Raises HostfixError for validation problems,
-    MigrationAborted if the user declines the confirmation prompt, and
-    returns the output directory on success."""
-    out_dir = out_dir or (world_dir.parent / (world_dir.name + "_migrated"))
-
-    if not GUID_STR_RE.match(old_uid_str):
-        raise HostfixError(f"--old-uid doesn't look like a GUID: {old_uid_str}")
-    new_uid_str = new_uid_str or SINGLEPLAYER_HOST_UID
-    if not GUID_STR_RE.match(new_uid_str):
-        raise HostfixError(f"--new-uid doesn't look like a GUID: {new_uid_str}")
-
+    new_uid_str: str,
+    out_dir: Path,
+    world_name: str | None,
+    force: bool,
+    yes: bool,
+) -> int:
+    """Byte-swap-and-write logic for perform_migration (dedicated server ->
+    single-player/co-op). Safe as a blind global replace because the
+    dedicated-server old_uid_str has 4 fully random bytes -- see the
+    module comment above scoped_unhost_swap() for why the reverse
+    direction can't use this same approach. old_uid_str/new_uid_str must
+    already be validated, resolved GUID strings. Raises HostfixError for
+    validation problems, MigrationAborted if the user declines the
+    confirmation prompt, and returns the number of references migrated in
+    Level.sav on success."""
     old_uid = guid_str_to_raw(old_uid_str)
     new_uid = guid_str_to_raw(new_uid_str)
 
@@ -421,6 +627,147 @@ def perform_migration(
         sf.write(out_dir / name)
         print(f"Wrote {out_dir / name}")
 
+    return n
+
+
+def _unhost_core(
+    world_dir: Path,
+    old_uid_str: str,
+    new_uid_str: str,
+    out_dir: Path,
+    world_name: str | None,
+    force: bool,
+    yes: bool,
+) -> int:
+    """Byte-swap-and-write logic for perform_unhost (single-player/co-op ->
+    dedicated server). Unlike _migrate_core, this uses scoped_unhost_swap()
+    instead of a blind global replace -- see the module comment above that
+    function for why. old_uid_str/new_uid_str must already be validated,
+    resolved GUID strings. Raises HostfixError for validation problems,
+    MigrationAborted if the user declines the confirmation prompt, and
+    returns the number of character/Pal references safely migrated in
+    Level.sav on success."""
+    old_uid = guid_str_to_raw(old_uid_str)
+
+    level_path = world_dir / "Level.sav"
+    old_player_path = world_dir / "Players" / f"{guid_str_to_filename_uid(old_uid_str)}.sav"
+    new_player_path_src = world_dir / "Players" / f"{guid_str_to_filename_uid(new_uid_str)}.sav"
+    if not level_path.exists():
+        raise HostfixError(f"No Level.sav found in {world_dir}")
+    if not old_player_path.exists():
+        raise HostfixError(
+            f"No player save found at {old_player_path}\n"
+            f"(run 'hostfix.py list {world_dir}' to see available player UIDs)"
+        )
+    if new_player_path_src.exists() and new_player_path_src != old_player_path:
+        if not force:
+            raise HostfixError(
+                f"REFUSING: a player save already exists for the target ID "
+                f"{new_uid_str}\n  ({new_player_path_src})\n"
+                "Migrating would merge that existing character's data with the one "
+                "you're moving in.\nIf you're sure that's what you want, re-run with --force."
+            )
+        print(f"--force given: proceeding even though {new_player_path_src} already exists.")
+
+    print(f"Loading {level_path} ...")
+    level = SavFile.load(level_path)
+
+    print(
+        "Scanning for your character/Pal records (structurally, not a blind "
+        "byte search -- see the tool's docs for why)..."
+    )
+    new_raw, n = scoped_unhost_swap(level.raw_gvas, old_uid_str, new_uid_str)
+    if n == 0:
+        raise HostfixError(
+            f"Could not find any character/Pal records structurally tied to "
+            f"{old_uid_str} in {level_path}.\nDouble-check you copied the UID "
+            "correctly."
+        )
+
+    print(f"\nFound {n} safely-verified character/Pal reference(s) to {old_uid_str} in the world file.")
+    print("Sample contexts (sanity-check these look like real save data, not garbage):")
+    for ctx in sample_contexts(level.raw_gvas, old_uid, n=3):
+        print(f"    ...{ctx!r}")
+    print(
+        "\nNote: guild membership and any placed/built structures can't be safely\n"
+        "verified for this ID and are intentionally left untouched -- see the\n"
+        "'Limitations' section of the README."
+    )
+
+    if not yes:
+        resp = input("\nProceed with the conversion? [y/N] ").strip().lower()
+        if resp != "y":
+            raise MigrationAborted()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "Players").mkdir(exist_ok=True)
+
+    level.raw_gvas = new_raw
+    level.write(out_dir / "Level.sav")
+    print(f"Wrote {out_dir / 'Level.sav'}  ({n} references migrated, verified byte-exact)")
+
+    # --- Player .sav: entirely the player's own data already, so the
+    # scoped technique covers it fully (their own PlayerUId and
+    # IndividualId.PlayerUId fields are clean StructProperty(Guid)s).
+    player = SavFile.load(old_player_path)
+    p_new_raw, p_n = scoped_unhost_swap(player.raw_gvas, old_uid_str, new_uid_str)
+    player.raw_gvas = p_new_raw
+    new_player_path = out_dir / "Players" / f"{guid_str_to_filename_uid(new_uid_str)}.sav"
+    player.write(new_player_path)
+    print(f"Wrote {new_player_path}  ({p_n} references migrated)")
+
+    # --- LevelMeta.sav / WorldOption.sav: pass through (also normalizes
+    # PlM -> PlZ), optionally rename the world. Neither file has
+    # character/guild/building data, so the marker-based half of the
+    # scoped technique (no CharacterSaveParameterMap lookup needed) is
+    # all that could ever apply, and it's cheap and fully safe to just
+    # always run.  LocalData.sav is intentionally skipped -- it's
+    # per-install local client state (fast-travel/map reveal, etc.) that
+    # dedicated servers don't use; each player who later connects builds
+    # up their own copy of it on their own PC.
+    for name in ("LevelMeta.sav", "WorldOption.sav"):
+        src = world_dir / name
+        if not src.exists():
+            continue
+        try:
+            sf = SavFile.load(src)
+        except Exception as e:
+            print(f"  (skipping {name}: could not decode -- {e})")
+            shutil.copy2(src, out_dir / name)
+            continue
+        sf.raw_gvas, _ = scoped_unhost_swap(sf.raw_gvas, old_uid_str, new_uid_str)
+        if name == "LevelMeta.sav" and world_name:
+            sf = _rename_world(sf, world_name)
+        sf.write(out_dir / name)
+        print(f"Wrote {out_dir / name}")
+
+    return n
+
+
+def perform_migration(
+    world_dir: Path,
+    old_uid_str: str,
+    new_uid_str: str | None = None,
+    out_dir: Path | None = None,
+    world_name: str | None = None,
+    force: bool = False,
+    yes: bool = False,
+) -> Path:
+    """Migrate a dedicated-server character into single-player/co-op.
+    Shared by the `migrate` CLI command and the interactive wizard. Raises
+    HostfixError for validation problems, MigrationAborted if the user
+    declines the confirmation prompt, and returns the output directory on
+    success."""
+    out_dir = out_dir or (world_dir.parent / (world_dir.name + "_migrated"))
+
+    if not GUID_STR_RE.match(old_uid_str):
+        raise HostfixError(f"--old-uid doesn't look like a GUID: {old_uid_str}")
+    new_uid_str = new_uid_str or SINGLEPLAYER_HOST_UID
+    if not GUID_STR_RE.match(new_uid_str):
+        raise HostfixError(f"--new-uid doesn't look like a GUID: {new_uid_str}")
+
+    _migrate_core(world_dir, old_uid_str, new_uid_str, out_dir, world_name, force, yes)
+
     print(
         f"\nDone. Copy the contents of:\n  {out_dir}\n"
         "into your local single-player save slot, e.g.:\n"
@@ -431,9 +778,82 @@ def perform_migration(
     return out_dir
 
 
+def perform_unhost(
+    world_dir: Path,
+    old_uid_str: str | None = None,
+    new_uid_str: str | None = None,
+    out_dir: Path | None = None,
+    world_name: str | None = None,
+    force: bool = False,
+    yes: bool = False,
+) -> tuple[Path, str]:
+    """The reverse of perform_migration: convert a single-player/co-op
+    world into save data ready to seed a brand-new dedicated server --
+    reassigns a player (by default the special single-player host ID) a
+    normal-looking, non-colliding dedicated-server-shaped ID. Character
+    level, stats, inventory, unlocked tech, and owned Pals are safely and
+    fully migrated via structural verification (see scoped_unhost_swap
+    above) rather than a blind byte search, since the default ID this
+    moves *away from* is low-entropy enough that a blind search produces
+    massive false-positive corruption. Guild membership and placed/built
+    structures can't be safely verified the same way and are intentionally
+    left untouched. Raises HostfixError for validation problems,
+    MigrationAborted if the user declines the confirmation prompt, and
+    returns (output directory, the new UID that was assigned) on success."""
+    out_dir = out_dir or (world_dir.parent / (world_dir.name + "_dedicated"))
+
+    old_uid_str = old_uid_str or SINGLEPLAYER_HOST_UID
+    if not GUID_STR_RE.match(old_uid_str):
+        raise HostfixError(f"--old-uid doesn't look like a GUID: {old_uid_str}")
+    if new_uid_str is None:
+        new_uid_str = generate_random_server_uid(world_dir)
+    elif not GUID_STR_RE.match(new_uid_str):
+        raise HostfixError(f"--new-uid doesn't look like a GUID: {new_uid_str}")
+
+    _unhost_core(world_dir, old_uid_str, new_uid_str, out_dir, world_name, force, yes)
+
+    print(
+        f"\nDone. Your character's new dedicated-server ID is:\n  {new_uid_str}\n"
+        "(you generally won't need this for anything -- other players who join "
+        "get their own IDs automatically -- but it's worth noting down in case "
+        "you need to find this character's save file later.)\n\n"
+        f"Copy the contents of:\n  {out_dir}\n"
+        "into your dedicated server's save folder, e.g.:\n"
+        r"  <PalServer install>\Pal\Saved\SaveGames\0\<WorldGUID>" "\\"
+        "\n(if this is a brand-new server, launch it once first so it generates "
+        "that folder, then fully stop the server before copying these files in.)\n\n"
+        "NOTE: LocalData.sav was intentionally not copied -- dedicated servers "
+        "don't use it. Guild membership and any structures you'd already built "
+        "were also intentionally left as-is (see the README's Limitations "
+        "section) -- you may need to create/rejoin a guild and rebuild or "
+        "reclaim your base on the new server. Worth double-checking "
+        "WorldOption.sav's server settings "
+        "(ServerName, ServerPassword, PublicPort, bIsMultiplay, etc. -- see "
+        "optioneditor) before starting the server for real."
+    )
+    return out_dir, new_uid_str
+
+
 def cmd_migrate(args: argparse.Namespace) -> None:
     try:
         perform_migration(
+            world_dir=Path(args.world_dir),
+            old_uid_str=args.old_uid,
+            new_uid_str=args.new_uid,
+            out_dir=Path(args.out) if args.out else None,
+            world_name=args.world_name,
+            force=args.force,
+            yes=args.yes,
+        )
+    except HostfixError as e:
+        sys.exit(str(e))
+    except MigrationAborted:
+        print("Aborted, nothing was written.")
+
+
+def cmd_unhost(args: argparse.Namespace) -> None:
+    try:
+        perform_unhost(
             world_dir=Path(args.world_dir),
             old_uid_str=args.old_uid,
             new_uid_str=args.new_uid,
@@ -594,6 +1014,77 @@ def run_interactive() -> None:
         print("\nAborted, nothing was written.")
 
 
+def run_interactive_unhost() -> None:
+    print("=" * 70)
+    print(" palworld-oodle-hostfix -- reverse mode")
+    print(" Convert a single-player/co-op world into a dedicated-server-ready save")
+    print("=" * 70)
+    print()
+
+    while True:
+        world_dir_str = _prompt(
+            "Path to your SINGLE-PLAYER/CO-OP world folder (the one with Level.sav "
+            "in it -- usually under ...\\Pal\\Saved\\SaveGames\\<SteamID>\\<WorldGUID>\\, "
+            "you can paste or drag-and-drop it here)"
+        )
+        world_dir = Path(world_dir_str)
+        if not world_dir.is_dir():
+            print(f"  '{world_dir}' isn't a folder. Try again.\n")
+            continue
+        if not (world_dir / "Level.sav").exists():
+            print(f"  No Level.sav found directly inside '{world_dir}'. "
+                  "Make sure you point at the folder that directly contains it.\n")
+            continue
+        break
+
+    print()
+    level, infos = scan_players(world_dir)
+    if not infos:
+        print("No player save files found in that world's Players/ folder. Nothing to do.")
+        return
+    print(f"Found {len(infos)} player(s) in this world:\n")
+    print_player_table(infos, numbered=True)
+
+    host_index = next((i for i, info in enumerate(infos) if info.is_singleplayer_host), None)
+    if host_index is not None:
+        print(
+            "(Usually you want the one tagged as the single-player host ID -- "
+            f"that's [{host_index + 1}].)\n"
+        )
+    else:
+        print()
+
+    choice = _prompt_choice("Which one do you want to move onto the dedicated server?", len(infos))
+    selected = infos[choice]
+    print(f"\nSelected: {selected.guid_str}  (Players/{selected.path.name})\n")
+
+    default_out = str(world_dir.parent / (world_dir.name + "_dedicated"))
+    out_dir_str = _prompt("Where should the server-ready save be written?", default=default_out)
+    out_dir = Path(_clean_path_input(out_dir_str))
+
+    world_name = _prompt(
+        "Rename the world (as it'll show in the server's world name)? "
+        "Leave blank to keep the original name",
+        default="",
+    )
+
+    print()
+    try:
+        perform_unhost(
+            world_dir=world_dir,
+            old_uid_str=selected.guid_str,
+            new_uid_str=None,
+            out_dir=out_dir,
+            world_name=world_name or None,
+            force=False,
+            yes=False,
+        )
+    except HostfixError as e:
+        print(f"\nSomething went wrong:\n  {e}")
+    except MigrationAborted:
+        print("\nAborted, nothing was written.")
+
+
 def main() -> None:
     if len(sys.argv) == 1:
         # No arguments at all -- most people sharing/running this tool
@@ -645,6 +1136,28 @@ def main() -> None:
         "merges two characters' data)",
     )
     p_migrate.set_defaults(func=cmd_migrate)
+
+    p_unhost = sub.add_parser(
+        "unhost", help="Convert a single-player/co-op world into a dedicated-server-ready save"
+    )
+    p_unhost.add_argument("world_dir", help="Path to the SOURCE single-player/co-op world folder")
+    p_unhost.add_argument(
+        "--old-uid", default=None,
+        help=f"The player UID to convert (default: the single-player host ID, {SINGLEPLAYER_HOST_UID})"
+    )
+    p_unhost.add_argument(
+        "--new-uid", default=None,
+        help="Target dedicated-server-shaped UID (default: a random, non-colliding one is generated)"
+    )
+    p_unhost.add_argument("--out", default=None, help="Output folder (default: <world_dir>_dedicated)")
+    p_unhost.add_argument("--world-name", default=None, help="Optionally rename the world too")
+    p_unhost.add_argument("-y", "--yes", action="store_true", help="Don't ask for confirmation")
+    p_unhost.add_argument(
+        "--force", action="store_true",
+        help="Proceed even if a player save already exists for --new-uid (DANGEROUS: "
+        "merges two characters' data)",
+    )
+    p_unhost.set_defaults(func=cmd_unhost)
 
     args = parser.parse_args()
     args.func(args)

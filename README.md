@@ -3,10 +3,15 @@
 Two small tools for Palworld saves using the newer **Oodle-compressed
 (`PlM`)** format (dedicated servers, since the 2026 save-format update):
 
-- **hostfix** — migrate a character from a **dedicated server** save into
-  a **single-player / co-op host** save, keeping their level, stats,
-  inventory, unlocked tech, owned Pals, guild membership, built
-  structures, and fast-travel/map reveal progress intact.
+- **hostfix** — migrate a character between a **dedicated server** save
+  and a **single-player / co-op host** save, in either direction:
+  - **migrate**: dedicated server -> single-player/co-op, keeping their
+    level, stats, inventory, unlocked tech, owned Pals, guild membership,
+    built structures, and fast-travel/map reveal progress intact.
+  - **unhost**: single-player/co-op -> a fresh dedicated server, keeping
+    their level, stats, inventory, unlocked tech, and owned Pals intact
+    (guild membership and built structures are a known limitation for
+    this direction specifically -- see below).
 - **optioneditor** — edit a world's settings (`WorldOption.sav`):
   difficulty, day/night speed, every XP/damage/drop-rate slider, PvP and
   multiplayer toggles, and (for a dedicated server) the server
@@ -79,7 +84,9 @@ That gives you a choice of the two tools:
 ```
   [1] Migrate a dedicated-server character into single-player/co-op
       (hostfix -- keeps your level, Pals, guild, and base)
-  [2] Edit world settings (WorldOption.sav)
+  [2] Convert a single-player/co-op world into a dedicated-server-ready save
+      (hostfix unhost -- keeps your level and Pals; see Limitations)
+  [3] Edit world settings (WorldOption.sav)
       (optioneditor -- difficulty, rates, PvP, server settings, etc.)
   [0] Exit
 ```
@@ -127,7 +134,49 @@ server. The window stays open with a summary and "Press Enter to exit"
 when it's done (or if something goes wrong), so nothing flashes shut on
 you.
 
-#### 2) optioneditor — edit world settings
+#### 2) hostfix unhost — prep a single-player/co-op world for a dedicated server
+
+The reverse direction: turns your single-player or co-op world into a
+save ready to seed a brand-new dedicated server (one nobody's joined
+yet). Same kind of walkthrough as above, just pick option `[2]` from the
+menu. It'll usually highlight the right character for you automatically:
+
+```
+Found 1 player(s) in this world:
+
+  [1] UID: 00000000-0000-0000-0000-000000000001  <- already the single-player host ID
+      file: Players/00000000000000000000000000000001.sav  (14,958 bytes)
+      referenced 19877 time(s) in Level.sav
+      best-effort name guess: (none found)
+
+(Usually you want the one tagged as the single-player host ID -- that's [1].)
+
+Which one do you want to move onto the dedicated server? [1-1]: 1
+
+Where should the server-ready save be written? [.../MyWorld_dedicated]:
+Rename the world (as it'll show in the server's world name)? Leave blank to keep the original name:
+
+Scanning for your character/Pal records (structurally, not a blind byte search -- see the tool's docs for why)...
+
+Found 1253 safely-verified character/Pal reference(s) to 00000000-0000-0000-0000-000000000001 in the world file.
+...
+Proceed with the conversion? [y/N] y
+```
+
+The "referenced N time(s)" count in the player list above is a rough,
+unverified scan (same as `migrate` shows) -- for the special single-player
+host ID it's normal for this to look much bigger than the actual number
+of things that get migrated, because that specific ID happens to
+coincidentally match a lot of unrelated padding elsewhere in the file.
+The "safely-verified" count printed right before the confirmation prompt
+is the real one; see [Safety](#safety) below for why the two differ.
+
+Once it's done, copy the output folder's contents into your dedicated
+server's save folder the same way as described in "Last step after
+migrating" below, just into your server's save directory instead of your
+local single-player one.
+
+#### 3) optioneditor — edit world settings
 
 Point it at a `WorldOption.sav` (the migrated one from step 1, or any
 world's) and pick a category, then a setting, then type a new value:
@@ -189,6 +238,20 @@ python hostfix.py migrate /path/to/world_folder \
 `--world-name` is optional, `-y`/`--yes` skips the confirmation prompt.
 Run `python hostfix.py migrate --help` for the full flag list.
 
+The reverse direction:
+
+```
+python hostfix.py unhost /path/to/single_player_world_folder \
+    --out /path/to/single_player_world_folder_dedicated \
+    --world-name "My World" \
+    -y
+```
+
+`--old-uid` defaults to the single-player host ID
+(`00000000-0000-0000-0000-000000000001`); `--new-uid` defaults to a
+random, non-colliding dedicated-server-shaped ID if you don't pass one.
+Run `python hostfix.py unhost --help` for the full flag list.
+
 **optioneditor** — inspect or change one setting at a time:
 
 ```
@@ -210,8 +273,8 @@ write elsewhere instead, or `--no-backup` to skip the backup.
 (Only applies to hostfix's output — optioneditor edits `WorldOption.sav`
 in place, so there's nothing extra to copy for that one.)
 
-Copy the *contents* of the output folder into a world slot under your
-local save directory:
+**For `migrate` (-> single-player/co-op):** copy the *contents* of the
+output folder into a world slot under your local save directory:
 
 ```
 %LOCALAPPDATA%\Pal\Saved\SaveGames\<YourSteamID>\<AnyWorldGUID>\
@@ -234,17 +297,60 @@ slot that you'd rather keep (e.g. from previously joining the same server
 as a client from this PC), back it up before copying the migrated files
 over it.
 
+**For `unhost` (-> a fresh dedicated server):** copy the *contents* of
+the output folder into your dedicated server's save folder, e.g.:
+
+```
+<PalServer install>\Pal\Saved\SaveGames\0\<WorldGUID>\
+```
+
+If this is a brand-new server, launch it once first so it generates that
+folder, then fully stop the server before copying the files in.
+`LocalData.sav` is intentionally not copied for this direction —
+dedicated servers don't use it; each player who joins later builds up
+their own copy on their own PC.
+
 ## Safety
 
-**hostfix:**
+**hostfix migrate (dedicated server -> single-player/co-op):**
 - Never writes to your source folder — always a new output folder.
 - Refuses to run if the target ID already has an existing player save on
   disk (that would silently merge two different characters' data)
   unless you pass `--force`.
+- Uses a single global find-and-replace of the old player ID's raw 16
+  bytes across the world file. This is safe here specifically because a
+  dedicated-server player ID has 4 fully random bytes (~4 billion
+  possible values) — across a save file with hundreds of thousands of
+  unrelated 16-byte fields, the odds of a coincidental false match are
+  astronomically low.
 - Before writing, verifies the number of changed bytes exactly matches
   `(occurrences found) × (bytes that differ between the old and new
   GUID)` — if that check doesn't line up exactly, it aborts without
   writing anything.
+
+**hostfix unhost (single-player/co-op -> dedicated server):**
+- Never writes to your source folder — always a new output folder.
+- Refuses to run if the target ID already has an existing player save on
+  disk, same as `migrate`, unless you pass `--force`.
+- Does **not** use a blind global find-and-replace. The ID this direction
+  moves *away from* by default (the special single-player host ID,
+  `00000000-0000-0000-0000-000000000001`) is almost all zero bytes, and
+  that exact pattern turns out to coincidentally match thousands of
+  unrelated all-zero-padded fields elsewhere in a real save (measured on
+  a real ~47MB world: 18,645 coincidental matches, versus 0 for a proper
+  random ID) — a blind replace using this ID would silently corrupt
+  unrelated Pals, items, and containers. Instead, `unhost` only ever
+  touches byte ranges it can *structurally* verify — by their exact
+  Unreal serialization layout, or by parsing the character/Pal ownership
+  map itself — really are your character's own data. See the
+  `scoped_unhost_swap` function in `hostfix.py` for the full technique if
+  you're curious.
+- Because of that, it only migrates what it can safely verify: your
+  character's own record and every Pal you currently own (level, stats,
+  inventory, unlocked tech, and Pals are all covered). Guild membership
+  and any structures you'd built are **not** migrated by this direction —
+  see Limitations below.
+- Same before-writing byte-count verification as `migrate`.
 
 **optioneditor:**
 - Only ever touches the one file you point it at, and only the specific
@@ -264,11 +370,20 @@ edit binary save file internals; that's inherently not risk-free.
   server shuts down (or migrate co-op ↔ dedicated)" use case — it is not
   a general-purpose save editor. optioneditor only covers `WorldOption.sav`
   (world/server settings) — it doesn't touch characters, Pals, or items.
-- Guild ownership can still be a little quirky after a hostfix migration
-  in some cases (this is a known rough edge in every tool that does this
-  kind of migration, not specific to this one) — if your base/guild
-  doesn't look right after loading, that's the most likely place to
-  check.
+- Guild ownership can still be a little quirky after a `migrate` in some
+  cases (this is a known rough edge in every tool that does this kind of
+  migration, not specific to this one) — if your base/guild doesn't look
+  right after loading, that's the most likely place to check.
+- **`unhost` does not migrate guild membership or placed/built
+  structures at all.** Unlike `migrate`, the ID it moves away from by
+  default is low-entropy enough that even a search scoped to one guild's
+  or one building's own data is unreliable (measured: 94% false-positive
+  matches for buildings, 78% for guild data, on real test data) — there's
+  no way to do it safely with the raw-byte technique this tool relies on.
+  Your character, their level/stats/inventory/tech, and every Pal they
+  own all transfer over fine; you'll likely need to create or rejoin a
+  guild, and rebuild or reclaim (via server admin commands, if your host
+  supports them) any base you'd already built, on the new server.
 - `LocalData.sav` is copied through opaquely (see above) — if your game
   version's internal layout for it ever changes in a way that breaks this,
   hostfix will print a warning and fall back to a raw file copy rather
