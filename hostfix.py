@@ -10,11 +10,19 @@ Migrate a Palworld character between a *dedicated server* save and a
   tied to the character (owned Pals, guild membership, placed/painted
   building pieces), keeping their level, inventory, and world progress
   intact.
-- `unhost`: single-player/co-op -> a fresh dedicated server. Moves the
-  character's level, inventory, and owned Pals; guild membership and
-  built structures are a known limitation for this direction specifically
-  (see scoped_unhost_swap()'s docstring/comment in this file, and the
-  README's Limitations section, for why).
+- `unhost`: single-player/co-op -> a fresh, never-joined dedicated server.
+  Moves the character's level, inventory, and owned Pals; guild membership
+  and built structures are a known limitation for this direction
+  specifically (see scoped_unhost_swap()'s docstring/comment in this file,
+  and the README's Limitations section, for why).
+- `sync`: single-player/co-op -> an ALREADY-LIVE, already-populated
+  dedicated server. Use this instead of `unhost` whenever the destination
+  server already has real history (for you and/or other people) -- it
+  surgically splices in only the target player's own character, owned
+  Pals, and personal containers, leaving every other player, the guild(s),
+  and built structures completely untouched (see the module comment above
+  `_dump_gvas` for why `unhost`'s whole-file approach would be destructive
+  here).
 
 Why this exists
 ----------------
@@ -80,16 +88,33 @@ Usage
     python hostfix.py migrate /path/to/world_folder --old-uid ... \\
         --out ... --world-name "MyWorld"
 
-    # Or the reverse: prep a single-player/co-op world to seed a fresh
-    # dedicated server (see the README's Limitations section first).
+    # Or the reverse: prep a single-player/co-op world to drop onto a
+    # dedicated server. --new-uid can't be made up (Palworld computes it
+    # from a hash of the player's Steam account) -- start the server,
+    # connect once with the real account, stop the server, then find it:
+    python hostfix.py list /path/to/server_save_folder
+
+    # ...then use that real ID:
     python hostfix.py unhost /path/to/single_player_world_folder \\
+        --new-uid <the real ID from the step above> \\
         --out /path/to/single_player_world_folder_dedicated
 
+    # (see the README's Limitations section for what unhost can't cover)
+
+    # Or, if your dedicated server ISN'T brand new -- it already has real
+    # progress for you and/or other people -- use `sync` instead, which
+    # never touches anyone else's data:
+    python hostfix.py list /path/to/server_save_folder  # find your real ID
+
+    python hostfix.py sync /path/to/single_player_world_folder \\
+        --server-dir /path/to/server_save_folder \\
+        --target-uid <your real ID from the step above>
+
 Then copy the output folder's contents into your local
-``...\\Pal\\Saved\\SaveGames\\<YourSteamID>\\<WorldGUID>\\`` (`migrate`) or
-your dedicated server's ``...\\Pal\\Saved\\SaveGames\\0\\<WorldGUID>\\``
-(`unhost`) -- create the ``WorldGUID`` folder if it doesn't already exist,
-the name doesn't matter, Palworld reads whatever's in there.
+``...\\Pal\\Saved\\SaveGames\\<YourSteamID>\\<WorldGUID>\\`` (`migrate`), or
+OVER your dedicated server's save folder, replacing the blank character it
+made when you connected (`unhost`), or the character it already has
+(`sync`).
 
 License: MIT. Use at your own risk -- this edits game save files.
 ALWAYS keep a backup of your original save before running this.
@@ -100,7 +125,6 @@ import argparse
 import contextlib
 import io
 import json
-import secrets
 import shutil
 import sys
 from dataclasses import dataclass
@@ -489,28 +513,6 @@ def scoped_unhost_swap(raw: bytes, old_uid_str: str, new_uid_str: str) -> tuple[
     return new_raw, n
 
 
-def generate_random_server_uid(world_dir: Path) -> str:
-    """Generates a dedicated-server-shaped player UID (XXXXXXXX-0000-0000-
-    0000-000000000000, matching the shape Palworld's own dedicated servers
-    hand out) that doesn't collide with any player already present in
-    world_dir's Players/ folder, for use as the --new-uid when converting a
-    single-player/co-op world into a fresh dedicated server."""
-    existing = set()
-    players_dir = world_dir / "Players"
-    if players_dir.exists():
-        for pf in players_dir.glob("*.sav"):
-            if UID_HEX_RE.match(pf.stem):
-                existing.add(filename_uid_to_guid_str(pf.stem))
-    for _ in range(1000):
-        prefix = secrets.token_hex(4)
-        if prefix == "00000000":
-            continue
-        candidate = f"{prefix}-0000-0000-0000-000000000000"
-        if candidate not in existing:
-            return candidate
-    raise HostfixError("Could not generate a non-colliding player UID -- this should never happen.")
-
-
 def _migrate_core(
     world_dir: Path,
     old_uid_str: str,
@@ -788,40 +790,70 @@ def perform_unhost(
     yes: bool = False,
 ) -> tuple[Path, str]:
     """The reverse of perform_migration: convert a single-player/co-op
-    world into save data ready to seed a brand-new dedicated server --
-    reassigns a player (by default the special single-player host ID) a
-    normal-looking, non-colliding dedicated-server-shaped ID. Character
-    level, stats, inventory, unlocked tech, and owned Pals are safely and
-    fully migrated via structural verification (see scoped_unhost_swap
-    above) rather than a blind byte search, since the default ID this
-    moves *away from* is low-entropy enough that a blind search produces
-    massive false-positive corruption. Guild membership and placed/built
-    structures can't be safely verified the same way and are intentionally
-    left untouched. Raises HostfixError for validation problems,
-    MigrationAborted if the user declines the confirmation prompt, and
-    returns (output directory, the new UID that was assigned) on success."""
+    world into save data ready to drop onto a dedicated server, reassigning
+    a player (by default the special single-player host ID) onto their
+    REAL dedicated-server player ID.
+
+    IMPORTANT: that real ID is NOT something this tool (or anything else)
+    can invent. Palworld derives a dedicated-server PlayerUId from a
+    one-way hash of the connecting player's own Steam account ID -- the
+    same real person always computes the same fixed ID when they connect,
+    and a save file can't reserve an arbitrary one in advance. So
+    new_uid_str must be the ID the server *already* assigned when that
+    player joined the (otherwise empty) server once -- run
+    `hostfix.py list <server_save_folder>` after that one join to find it.
+    Passing a made-up ID here will produce a save nobody can ever actually
+    log in as; the server will just create a brand-new character instead.
+
+    Character level, stats, inventory, unlocked tech, and owned Pals are
+    safely and fully migrated via structural verification (see
+    scoped_unhost_swap above) rather than a blind byte search, since the
+    ID this moves *away from* by default is low-entropy enough that a
+    blind search produces massive false-positive corruption. Guild
+    membership and placed/built structures can't be safely verified the
+    same way and are intentionally left untouched. Raises HostfixError for
+    validation problems, MigrationAborted if the user declines the
+    confirmation prompt, and returns (output directory, the new UID) on
+    success."""
     out_dir = out_dir or (world_dir.parent / (world_dir.name + "_dedicated"))
 
     old_uid_str = old_uid_str or SINGLEPLAYER_HOST_UID
     if not GUID_STR_RE.match(old_uid_str):
         raise HostfixError(f"--old-uid doesn't look like a GUID: {old_uid_str}")
     if new_uid_str is None:
-        new_uid_str = generate_random_server_uid(world_dir)
-    elif not GUID_STR_RE.match(new_uid_str):
+        raise HostfixError(
+            "--new-uid is required for unhost -- and it can't be made up.\n"
+            "Palworld computes a dedicated-server player's ID from a one-way hash "
+            "of their own Steam account, so there's no ID this tool can invent that "
+            "a real player could ever actually connect as.\n\n"
+            "The correct order is:\n"
+            "  1. Start your (otherwise empty) dedicated server.\n"
+            "  2. Connect to it ONCE with the real account you'll play as, then "
+            "disconnect and fully stop the server.\n"
+            "     (this makes the server compute and assign your real ID, as a "
+            "blank freshly-spawned character)\n"
+            "  3. Run: hostfix.py list <server_save_folder>  -- to find that real ID.\n"
+            "  4. Re-run unhost with --new-uid set to that ID, then copy this tool's "
+            "output OVER the server's save folder (replacing the blank character "
+            "you just made in step 2)."
+        )
+    if not GUID_STR_RE.match(new_uid_str):
         raise HostfixError(f"--new-uid doesn't look like a GUID: {new_uid_str}")
 
     _unhost_core(world_dir, old_uid_str, new_uid_str, out_dir, world_name, force, yes)
 
     print(
-        f"\nDone. Your character's new dedicated-server ID is:\n  {new_uid_str}\n"
-        "(you generally won't need this for anything -- other players who join "
-        "get their own IDs automatically -- but it's worth noting down in case "
-        "you need to find this character's save file later.)\n\n"
+        f"\nDone. Your character's data is now filed under your real "
+        f"dedicated-server ID:\n  {new_uid_str}\n\n"
         f"Copy the contents of:\n  {out_dir}\n"
-        "into your dedicated server's save folder, e.g.:\n"
+        "OVER your dedicated server's save folder -- e.g.:\n"
         r"  <PalServer install>\Pal\Saved\SaveGames\0\<WorldGUID>" "\\"
-        "\n(if this is a brand-new server, launch it once first so it generates "
-        "that folder, then fully stop the server before copying these files in.)\n\n"
+        "\n"
+        f"This REPLACES the blank character the server made when you first "
+        f"connected (that's expected -- it's why {new_uid_str} already had a "
+        f"Players/ file for the server to overwrite). Make sure the server is "
+        "fully stopped before copying these files in, then start it back up "
+        "and reconnect.\n\n"
         "NOTE: LocalData.sav was intentionally not copied -- dedicated servers "
         "don't use it. Guild membership and any structures you'd already built "
         "were also intentionally left as-is (see the README's Limitations "
@@ -832,6 +864,353 @@ def perform_unhost(
         "optioneditor) before starting the server for real."
     )
     return out_dir, new_uid_str
+
+
+# --------------------------------------------------------------------------
+# "sync" -- splice a single character's own records into an ALREADY-LIVE,
+# already-populated dedicated server, touching nothing else
+#
+# `unhost` (above) assumes the destination is a brand-new, never-joined
+# server -- it works by editing the *server's own* blank auto-generated
+# character in place. That's the wrong tool if the destination already has
+# real history for other people (or even for you): a naive whole-Level.sav
+# push from single-player would blow away everyone else's progress. Worse,
+# single-player mode has been observed (empirically, on a real save) to
+# silently prune/degrade OTHER, non-connectable players' Pal-ownership data
+# over time just from normal solo play -- so even a very recent
+# single-player save can already be lossy for people who aren't the one
+# playing it, making a whole-file push actively dangerous, not just
+# unnecessary.
+#
+# `sync` avoids all of that by never touching the destination Level.sav as
+# a whole. It parses both worlds structurally -- via palworld-save-tools'
+# JSON dump/load round-trip, verified byte-identical on this save format
+# when left unmodified -- and replaces ONLY:
+#   - CharacterSaveParameterMap entries keyed to the target player (their
+#     own character record, plus every Pal entry keyed to their PlayerUId)
+#   - ItemContainerSaveData / CharacterContainerSaveData entries whose ID
+#     matches one of the target player's own container IDs (inventory,
+#     equipped gear, party, Palbox -- read cleanly off each side's own
+#     Players/<uid>.sav, which (unlike the map's RawData blobs) is NOT
+#     opaque)
+# Every other player, GroupSaveDataMap (guild), and MapObjectSaveData
+# (buildings) are left completely alone -- sourced only from the
+# destination and never even inspected for edits.
+#
+# Collision handling: if a Pal being added from the source has an
+# InstanceId that also exists in a destination entry NOT being replaced
+# (owned by someone/something else), it's skipped rather than duplicated
+# or force-overwritten, and reported so you can decide what to do about it
+# by hand.
+# --------------------------------------------------------------------------
+def _dump_gvas(raw: bytes) -> tuple[object, dict]:
+    """Parse decompressed GVAS bytes into (GvasFile, dumped-dict) via
+    palworld-save-tools' structural reader. `sync` needs this (unlike
+    migrate/unhost's raw-byte patching) because adding/removing whole map
+    entries changes the file's byte length -- something a fixed-offset
+    patch can't do."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        from palworld_save_tools.gvas import GvasFile
+        from palworld_save_tools.paltypes import PALWORLD_TYPE_HINTS
+
+        gvas = GvasFile.read(raw, PALWORLD_TYPE_HINTS, {}, allow_nan=True)
+        return gvas, gvas.dump()
+
+
+def _reserialize_gvas(dumped: dict) -> bytes:
+    """The other half of the round-trip _dump_gvas started: turn an edited
+    dumped dict back into raw GVAS bytes. Verified byte-identical to the
+    original input when the dict is left unmodified, on real production
+    Oodle-format saves (both a ~43MB single-player Level.sav and a real
+    server Level.sav)."""
+    from palworld_save_tools.gvas import GvasFile
+
+    new_gvas = GvasFile.load(dumped)
+    return new_gvas.write({})
+
+
+def _container_ids_from_player(player_dumped: dict) -> tuple[set[str], set[str]]:
+    """A player's own Players/<uid>.sav SaveData is fully clean/structurally
+    typed (unlike CharacterSaveParameterMap's opaque RawData blobs) -- pull
+    out the container IDs it owns: personal item containers (inventory,
+    equipped weapon/armor/lantern, drop slot) and character containers
+    (Otomo party, Palbox storage). These IDs are stable for a character's
+    whole lifetime, so the same set applies on both the single-player and
+    server side. Returns (item_container_ids, character_container_ids)."""
+    sd = player_dumped["properties"]["SaveData"]["value"]
+    item_ids: set[str] = set()
+    char_ids: set[str] = set()
+    inv = sd.get("InventoryInfo", {}).get("value", {})
+    for key in (
+        "CommonContainerId", "DropSlotContainerId", "EssentialContainerId",
+        "WeaponLoadOutContainerId", "PlayerEquipArmorContainerId", "FoodEquipContainerId",
+    ):
+        node = inv.get(key)
+        if node:
+            item_ids.add(node["value"]["ID"]["value"])
+    for key in ("OtomoCharacterContainerId", "PalStorageContainerId"):
+        node = sd.get(key)
+        if node:
+            char_ids.add(node["value"]["ID"]["value"])
+    return item_ids, char_ids
+
+
+@dataclass
+class SyncStats:
+    records_removed: int
+    records_added: int
+    collisions_skipped: list[str]
+    item_containers_replaced: int
+    char_containers_replaced: int
+
+
+def _splice_player_records(
+    src_dumped: dict,
+    dst_dumped: dict,
+    src_player_dumped: dict,
+    dst_player_dumped: dict,
+    old_uid_str: str,
+    target_uid_str: str,
+) -> SyncStats:
+    """Mutates dst_dumped IN PLACE: replaces the target player's own
+    CharacterSaveParameterMap/ItemContainerSaveData/CharacterContainerSaveData
+    entries with the source's, leaving every other entry untouched. See the
+    module comment above this section for the full design and why it's
+    safe."""
+    src_item_ids, src_char_ids = _container_ids_from_player(src_player_dumped)
+    dst_item_ids, dst_char_ids = _container_ids_from_player(dst_player_dumped)
+    item_ids = src_item_ids | dst_item_ids
+    char_ids = src_char_ids | dst_char_ids
+
+    wsd_src = src_dumped["properties"]["worldSaveData"]["value"]
+    wsd_dst = dst_dumped["properties"]["worldSaveData"]["value"]
+
+    # --- CharacterSaveParameterMap: the player's own record + every Pal
+    # they currently own.
+    csm_src = wsd_src["CharacterSaveParameterMap"]["value"]
+    csm_dst = wsd_dst["CharacterSaveParameterMap"]["value"]
+
+    kept = [e for e in csm_dst if e["key"]["PlayerUId"]["value"] != target_uid_str]
+    removed_n = len(csm_dst) - len(kept)
+    added = [e for e in csm_src if e["key"]["PlayerUId"]["value"] == old_uid_str]
+
+    kept_instance_ids = {e["key"]["InstanceId"]["value"] for e in kept}
+    collisions = [
+        e["key"]["InstanceId"]["value"] for e in added
+        if e["key"]["InstanceId"]["value"] in kept_instance_ids
+    ]
+    added_filtered = [e for e in added if e["key"]["InstanceId"]["value"] not in kept_instance_ids]
+
+    for e in added_filtered:
+        e["key"]["PlayerUId"]["value"] = target_uid_str
+    csm_dst[:] = kept + added_filtered
+
+    # --- ItemContainerSaveData / CharacterContainerSaveData: swap in the
+    # source's containers for every ID either side reports as the player's
+    # own (matched by clean container ID, never by opaque RawData).
+    icd_src = wsd_src["ItemContainerSaveData"]["value"]
+    icd_dst = wsd_dst["ItemContainerSaveData"]["value"]
+    kept_icd = [e for e in icd_dst if e["key"]["ID"]["value"] not in item_ids]
+    added_icd = [e for e in icd_src if e["key"]["ID"]["value"] in item_ids]
+    icd_dst[:] = kept_icd + added_icd
+
+    ccd_src = wsd_src["CharacterContainerSaveData"]["value"]
+    ccd_dst = wsd_dst["CharacterContainerSaveData"]["value"]
+    kept_ccd = [e for e in ccd_dst if e["key"]["ID"]["value"] not in char_ids]
+    added_ccd = [e for e in ccd_src if e["key"]["ID"]["value"] in char_ids]
+    ccd_dst[:] = kept_ccd + added_ccd
+
+    return SyncStats(
+        records_removed=removed_n,
+        records_added=len(added_filtered),
+        collisions_skipped=collisions,
+        item_containers_replaced=len(added_icd),
+        char_containers_replaced=len(added_ccd),
+    )
+
+
+def _check_no_duplicate_ids(dst_dumped: dict) -> None:
+    """Sanity check run after splicing, before anything is written: the
+    splice logic in _splice_player_records should make this structurally
+    impossible (kept/added are always partitioned by ID), but for
+    something about to be written onto a live, shared server, checking
+    costs nothing and catches a future bug here before it reaches disk."""
+    wsd = dst_dumped["properties"]["worldSaveData"]["value"]
+    checks = (
+        ("CharacterSaveParameterMap", wsd["CharacterSaveParameterMap"]["value"],
+         lambda e: e["key"]["InstanceId"]["value"]),
+        ("ItemContainerSaveData", wsd["ItemContainerSaveData"]["value"],
+         lambda e: e["key"]["ID"]["value"]),
+        ("CharacterContainerSaveData", wsd["CharacterContainerSaveData"]["value"],
+         lambda e: e["key"]["ID"]["value"]),
+    )
+    for name, entries, key_fn in checks:
+        ids = [key_fn(e) for e in entries]
+        if len(ids) != len(set(ids)):
+            dupes = sorted({i for i in ids if ids.count(i) > 1})
+            raise HostfixError(
+                f"INTERNAL SANITY CHECK FAILED: {name} has duplicate key(s) after "
+                f"splicing ({len(dupes)} duplicated ID(s), e.g. {dupes[0]}). Refusing "
+                "to write a file that didn't verify cleanly -- please open an issue "
+                "with this save."
+            )
+
+
+def _sync_core(
+    local_world_dir: Path,
+    server_dir: Path,
+    old_uid_str: str,
+    target_uid_str: str,
+    out_dir: Path,
+    yes: bool,
+) -> SyncStats:
+    """Load both worlds, splice, confirm, and write output. Raises
+    HostfixError for validation problems, MigrationAborted if the user
+    declines the confirmation prompt."""
+    src_level_path = local_world_dir / "Level.sav"
+    dst_level_path = server_dir / "Level.sav"
+    src_player_path = local_world_dir / "Players" / f"{guid_str_to_filename_uid(old_uid_str)}.sav"
+    dst_player_path = server_dir / "Players" / f"{guid_str_to_filename_uid(target_uid_str)}.sav"
+
+    for p, label in (
+        (src_level_path, "single-player world's Level.sav"),
+        (dst_level_path, "server's Level.sav"),
+        (src_player_path, "single-player character's save"),
+        (dst_player_path, "server character's save"),
+    ):
+        if not p.exists():
+            raise HostfixError(
+                f"No {label} found at:\n  {p}\n"
+                "(run 'hostfix.py list <folder>' on each side to double-check the UIDs)"
+            )
+
+    print(f"Loading {src_level_path} ...")
+    src_level = SavFile.load(src_level_path)
+    print(f"Loading {dst_level_path} (this can take a minute for a large world)...")
+    dst_level = SavFile.load(dst_level_path)
+
+    print("Parsing both worlds structurally (this can also take a minute)...")
+    _, src_dumped = _dump_gvas(src_level.raw_gvas)
+    dst_gvas, dst_dumped = _dump_gvas(dst_level.raw_gvas)
+
+    src_player = SavFile.load(src_player_path)
+    dst_player = SavFile.load(dst_player_path)
+    _, src_player_dumped = _dump_gvas(src_player.raw_gvas)
+    _, dst_player_dumped = _dump_gvas(dst_player.raw_gvas)
+
+    stats = _splice_player_records(
+        src_dumped, dst_dumped, src_player_dumped, dst_player_dumped, old_uid_str, target_uid_str,
+    )
+    _check_no_duplicate_ids(dst_dumped)
+
+    print(
+        f"\nCharacterSaveParameterMap: replacing {stats.records_removed} stale server "
+        f"record(s) with {stats.records_added} fresh one(s) from your single-player save "
+        f"(your character + every Pal you currently own)."
+    )
+    print(
+        f"Containers: replacing {stats.item_containers_replaced} item container(s) "
+        f"(inventory/equipment) and {stats.char_containers_replaced} character "
+        f"container(s) (party/Palbox)."
+    )
+    if stats.collisions_skipped:
+        print(
+            f"\nHeads up: {len(stats.collisions_skipped)} Pal(s) in your single-player save "
+            "share an ID with something that already exists on the server under someone "
+            "or something else -- these were left as-is on the server rather than risk "
+            "duplicating or overwriting them:"
+        )
+        for iid in stats.collisions_skipped:
+            print(f"    {iid}")
+    print(
+        "\nEverything else on the server -- every other player, the guild(s), and all "
+        "placed/built structures -- is untouched: not read, not re-serialized, not "
+        "written."
+    )
+
+    if not yes:
+        resp = input("\nProceed and write the updated server save? [y/N] ").strip().lower()
+        if resp != "y":
+            raise MigrationAborted()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "Players").mkdir(exist_ok=True)
+
+    print("\nReserializing the server's world file (this is the slow part)...")
+    new_raw = _reserialize_gvas(dst_dumped)
+    new_level = SavFile(path=out_dir / "Level.sav", raw_gvas=new_raw, save_type=dst_level.save_type)
+    new_level.write(out_dir / "Level.sav")
+    print(f"Wrote {out_dir / 'Level.sav'}")
+
+    print("Verifying the written file re-parses cleanly...")
+    try:
+        reloaded = SavFile.load(out_dir / "Level.sav")
+        _dump_gvas(reloaded.raw_gvas)
+    except Exception as e:
+        raise HostfixError(
+            f"INTERNAL SANITY CHECK FAILED: the file just written to "
+            f"{out_dir / 'Level.sav'} does not re-parse cleanly ({e}).\n"
+            "Do NOT copy this output onto your server -- please open an issue with "
+            "this save."
+        )
+    print("  OK -- re-parses cleanly.")
+
+    # --- Player .sav: relabel the single-player character's own save file
+    # onto the server's target ID, via the same structurally-verified
+    # technique unhost uses (safe regardless of old_uid_str's entropy).
+    print("Relabeling your character's own save file onto the server's target ID...")
+    p_new_raw, p_n = scoped_unhost_swap(src_player.raw_gvas, old_uid_str, target_uid_str)
+    new_player_path = out_dir / "Players" / f"{guid_str_to_filename_uid(target_uid_str)}.sav"
+    new_player = SavFile(path=new_player_path, raw_gvas=p_new_raw, save_type=src_player.save_type)
+    new_player.write(new_player_path)
+    print(f"Wrote {new_player_path}  ({p_n} references migrated)")
+
+    return stats
+
+
+def perform_sync(
+    local_world_dir: Path,
+    server_dir: Path,
+    target_uid_str: str,
+    old_uid_str: str | None = None,
+    out_dir: Path | None = None,
+    yes: bool = False,
+) -> Path:
+    """Splice a single character's own records from a single-player/co-op
+    world into an ALREADY-LIVE, already-populated dedicated server, without
+    touching any other player, the guild(s), or built structures. Use this
+    instead of `unhost` whenever the destination server already has real
+    history -- either for other people, or for you (e.g. you played solo as
+    a stopgap and now want to bring that progress back to the shared
+    server). See the module comment above _dump_gvas for the full design
+    and why a naive whole-Level.sav push (what `unhost` does, correctly,
+    for a brand-new server) would be destructive here instead.
+
+    old_uid_str defaults to the single-player host ID. target_uid_str must
+    be the player's REAL, already-established ID on the destination server
+    -- run `hostfix.py list <server_save_folder>` to find it (unlike
+    `unhost`, there's no "join once with a blank character first" step
+    needed, since this player already exists on the server). Raises
+    HostfixError for validation problems, MigrationAborted if the user
+    declines the confirmation prompt, and returns the output directory on
+    success."""
+    out_dir = out_dir or (server_dir.parent / (server_dir.name + "_synced"))
+
+    old_uid_str = old_uid_str or SINGLEPLAYER_HOST_UID
+    if not GUID_STR_RE.match(old_uid_str):
+        raise HostfixError(f"--old-uid doesn't look like a GUID: {old_uid_str}")
+    if not GUID_STR_RE.match(target_uid_str):
+        raise HostfixError(f"--target-uid doesn't look like a GUID: {target_uid_str}")
+
+    _sync_core(local_world_dir, server_dir, old_uid_str, target_uid_str, out_dir, yes)
+
+    print(
+        f"\nDone. Copy the contents of:\n  {out_dir}\n"
+        f"OVER your dedicated server's save folder:\n  {server_dir}\n"
+        "Make sure the server is fully stopped before copying these files in, then "
+        "start it back up and reconnect."
+    )
+    return out_dir
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
@@ -860,6 +1239,22 @@ def cmd_unhost(args: argparse.Namespace) -> None:
             out_dir=Path(args.out) if args.out else None,
             world_name=args.world_name,
             force=args.force,
+            yes=args.yes,
+        )
+    except HostfixError as e:
+        sys.exit(str(e))
+    except MigrationAborted:
+        print("Aborted, nothing was written.")
+
+
+def cmd_sync(args: argparse.Namespace) -> None:
+    try:
+        perform_sync(
+            local_world_dir=Path(args.local_world_dir),
+            server_dir=Path(args.server_dir),
+            target_uid_str=args.target_uid,
+            old_uid_str=args.old_uid,
+            out_dir=Path(args.out) if args.out else None,
             yes=args.yes,
         )
     except HostfixError as e:
@@ -1014,20 +1409,12 @@ def run_interactive() -> None:
         print("\nAborted, nothing was written.")
 
 
-def run_interactive_unhost() -> None:
-    print("=" * 70)
-    print(" palworld-oodle-hostfix -- reverse mode")
-    print(" Convert a single-player/co-op world into a dedicated-server-ready save")
-    print("=" * 70)
-    print()
-
+def _prompt_world_folder(msg: str) -> Path:
+    """Prompt for a folder path, re-prompting until it exists and directly
+    contains a Level.sav."""
     while True:
-        world_dir_str = _prompt(
-            "Path to your SINGLE-PLAYER/CO-OP world folder (the one with Level.sav "
-            "in it -- usually under ...\\Pal\\Saved\\SaveGames\\<SteamID>\\<WorldGUID>\\, "
-            "you can paste or drag-and-drop it here)"
-        )
-        world_dir = Path(world_dir_str)
+        raw = _prompt(msg)
+        world_dir = Path(raw)
         if not world_dir.is_dir():
             print(f"  '{world_dir}' isn't a folder. Try again.\n")
             continue
@@ -1035,7 +1422,40 @@ def run_interactive_unhost() -> None:
             print(f"  No Level.sav found directly inside '{world_dir}'. "
                   "Make sure you point at the folder that directly contains it.\n")
             continue
-        break
+        return world_dir
+
+
+def run_interactive_unhost() -> None:
+    print("=" * 70)
+    print(" palworld-oodle-hostfix -- reverse mode")
+    print(" Convert a single-player/co-op world into a dedicated-server-ready save")
+    print("=" * 70)
+    print()
+    print(
+        "IMPORTANT: a dedicated-server player ID isn't something anyone can make "
+        "up -- Palworld computes it from a one-way hash of the connecting player's "
+        "own Steam account, the same way every time. So before this can work, the "
+        "REAL account you'll play as needs to have already connected to your "
+        "(otherwise empty) dedicated server once -- that's what makes the server "
+        "compute and assign that real ID, as a blank freshly-spawned character.\n"
+    )
+    if not _prompt_yes_no(
+        "Have you already started your dedicated server, connected to it ONCE with "
+        "the real account you'll play as, and then fully stopped the server again?",
+        default=False,
+    ):
+        print(
+            "\nNo problem -- go do that first (start the server, connect once, "
+            "disconnect, stop the server), then come back and run this again."
+        )
+        return
+    print()
+
+    world_dir = _prompt_world_folder(
+        "Path to your SINGLE-PLAYER/CO-OP world folder (the one with Level.sav "
+        "in it -- usually under ...\\Pal\\Saved\\SaveGames\\<SteamID>\\<WorldGUID>\\, "
+        "you can paste or drag-and-drop it here)"
+    )
 
     print()
     level, infos = scan_players(world_dir)
@@ -1058,6 +1478,32 @@ def run_interactive_unhost() -> None:
     selected = infos[choice]
     print(f"\nSelected: {selected.guid_str}  (Players/{selected.path.name})\n")
 
+    server_dir = _prompt_world_folder(
+        "Now point me at your DEDICATED SERVER's save folder (the one you just "
+        "connected to once -- usually under "
+        "<PalServer install>\\Pal\\Saved\\SaveGames\\0\\<WorldGUID>\\)"
+    )
+    print()
+    _, server_infos = scan_players(server_dir, quiet=True)
+    if not server_infos:
+        print(
+            "  No player save files found in that server's Players/ folder -- which "
+            "means the server hasn't actually assigned anyone a real ID yet. Make "
+            "sure you connected to it at least once (per the instructions above), "
+            "then try again."
+        )
+        return
+    print(f"Found {len(server_infos)} player(s) already on that server:\n")
+    print_player_table(server_infos, numbered=True)
+    print(
+        "(This should be the blank, freshly-spawned character the server made "
+        "when you connected just now -- pick whichever one is you. If more than "
+        "one already has real progress, be careful: this will overwrite it.)\n"
+    )
+    server_choice = _prompt_choice("Which one is the real you on the server?", len(server_infos))
+    target = server_infos[server_choice]
+    print(f"\nTarget dedicated-server ID: {target.guid_str}  (Players/{target.path.name})\n")
+
     default_out = str(world_dir.parent / (world_dir.name + "_dedicated"))
     out_dir_str = _prompt("Where should the server-ready save be written?", default=default_out)
     out_dir = Path(_clean_path_input(out_dir_str))
@@ -1073,11 +1519,103 @@ def run_interactive_unhost() -> None:
         perform_unhost(
             world_dir=world_dir,
             old_uid_str=selected.guid_str,
-            new_uid_str=None,
+            new_uid_str=target.guid_str,
             out_dir=out_dir,
             world_name=world_name or None,
             force=False,
             yes=False,
+        )
+        print(
+            f"\nRemember: copy the contents of {out_dir} OVER {server_dir}, "
+            "replacing the blank character there -- not into a new folder."
+        )
+    except HostfixError as e:
+        print(f"\nSomething went wrong:\n  {e}")
+    except MigrationAborted:
+        print("\nAborted, nothing was written.")
+
+
+def run_interactive_sync() -> None:
+    print("=" * 70)
+    print(" palworld-oodle-hostfix -- sync mode")
+    print(" Update your character on an already-live dedicated server")
+    print(" from a single-player/co-op save, without touching anyone else")
+    print("=" * 70)
+    print()
+    print(
+        "Use this instead of the 'unhost' option when your dedicated server ISN'T "
+        "brand new -- i.e. it already has real progress for you and/or other people. "
+        "A whole-world push (what 'unhost' does) would blow away that history; this "
+        "instead surgically updates only YOUR character, your owned Pals, and your "
+        "personal containers (inventory/equipment/party/Palbox) -- every other "
+        "player, the guild(s), and built structures are left completely untouched.\n"
+    )
+
+    world_dir = _prompt_world_folder(
+        "Path to your SINGLE-PLAYER/CO-OP world folder (the one with Level.sav in "
+        "it -- usually under ...\\Pal\\Saved\\SaveGames\\<SteamID>\\<WorldGUID>\\, "
+        "you can paste or drag-and-drop it here)"
+    )
+
+    print()
+    level, infos = scan_players(world_dir)
+    if not infos:
+        print("No player save files found in that world's Players/ folder. Nothing to do.")
+        return
+    print(f"Found {len(infos)} player(s) in this world:\n")
+    print_player_table(infos, numbered=True)
+
+    host_index = next((i for i, info in enumerate(infos) if info.is_singleplayer_host), None)
+    if host_index is not None:
+        print(
+            "(Usually you want the one tagged as the single-player host ID -- "
+            f"that's [{host_index + 1}].)\n"
+        )
+    else:
+        print()
+
+    choice = _prompt_choice("Which one do you want to sync onto the server?", len(infos))
+    selected = infos[choice]
+    print(f"\nSelected: {selected.guid_str}  (Players/{selected.path.name})\n")
+
+    server_dir = _prompt_world_folder(
+        "Now point me at your LIVE DEDICATED SERVER's save folder (the one that's "
+        "currently running / has your and others' real progress on it -- usually "
+        "under <PalServer install>\\Pal\\Saved\\SaveGames\\0\\<WorldGUID>\\)"
+    )
+    print()
+    _, server_infos = scan_players(server_dir, quiet=True)
+    if not server_infos:
+        print("  No player save files found in that server's Players/ folder.")
+        return
+    print(f"Found {len(server_infos)} player(s) already on that server:\n")
+    print_player_table(server_infos, numbered=True)
+    print(
+        "(Pick whichever one is YOUR real, already-established character on the "
+        "server -- this is the one that will be updated. Everyone else in this "
+        "list is left completely alone.)\n"
+    )
+    server_choice = _prompt_choice("Which one is you on the server?", len(server_infos))
+    target = server_infos[server_choice]
+    print(f"\nTarget dedicated-server ID: {target.guid_str}  (Players/{target.path.name})\n")
+
+    default_out = str(server_dir.parent / (server_dir.name + "_synced"))
+    out_dir_str = _prompt("Where should the updated server save be written?", default=default_out)
+    out_dir = Path(_clean_path_input(out_dir_str))
+
+    print()
+    try:
+        perform_sync(
+            local_world_dir=world_dir,
+            server_dir=server_dir,
+            target_uid_str=target.guid_str,
+            old_uid_str=selected.guid_str,
+            out_dir=out_dir,
+            yes=False,
+        )
+        print(
+            f"\nRemember: copy the contents of {out_dir} OVER {server_dir}, "
+            "replacing your character there -- not into a new folder."
         )
     except HostfixError as e:
         print(f"\nSomething went wrong:\n  {e}")
@@ -1146,8 +1684,12 @@ def main() -> None:
         help=f"The player UID to convert (default: the single-player host ID, {SINGLEPLAYER_HOST_UID})"
     )
     p_unhost.add_argument(
-        "--new-uid", default=None,
-        help="Target dedicated-server-shaped UID (default: a random, non-colliding one is generated)"
+        "--new-uid", required=True,
+        help="Your REAL dedicated-server player UID -- NOT something you can make up. "
+        "Palworld derives it from a hash of your Steam account, so first: start the "
+        "(otherwise empty) server, connect to it once with the real account you'll "
+        "play as, fully stop the server, then run 'hostfix.py list <server_save_folder>' "
+        "to find this value.",
     )
     p_unhost.add_argument("--out", default=None, help="Output folder (default: <world_dir>_dedicated)")
     p_unhost.add_argument("--world-name", default=None, help="Optionally rename the world too")
@@ -1158,6 +1700,29 @@ def main() -> None:
         "merges two characters' data)",
     )
     p_unhost.set_defaults(func=cmd_unhost)
+
+    p_sync = sub.add_parser(
+        "sync",
+        help="Update YOUR character on an already-live dedicated server from a "
+        "single-player/co-op save, without touching anyone else",
+    )
+    p_sync.add_argument("local_world_dir", help="Path to the SOURCE single-player/co-op world folder")
+    p_sync.add_argument(
+        "--server-dir", required=True,
+        help="Path to the LIVE dedicated server's save folder to update",
+    )
+    p_sync.add_argument(
+        "--target-uid", required=True,
+        help="Your REAL, already-established player UID on that server (see the 'list' command)",
+    )
+    p_sync.add_argument(
+        "--old-uid", default=None,
+        help="The player UID to sync from in the single-player world (default: the "
+        f"single-player host ID, {SINGLEPLAYER_HOST_UID})",
+    )
+    p_sync.add_argument("--out", default=None, help="Output folder (default: <server_dir>_synced)")
+    p_sync.add_argument("-y", "--yes", action="store_true", help="Don't ask for confirmation")
+    p_sync.set_defaults(func=cmd_sync)
 
     args = parser.parse_args()
     args.func(args)

@@ -8,10 +8,16 @@ Two small tools for Palworld saves using the newer **Oodle-compressed
   - **migrate**: dedicated server -> single-player/co-op, keeping their
     level, stats, inventory, unlocked tech, owned Pals, guild membership,
     built structures, and fast-travel/map reveal progress intact.
-  - **unhost**: single-player/co-op -> a fresh dedicated server, keeping
-    their level, stats, inventory, unlocked tech, and owned Pals intact
-    (guild membership and built structures are a known limitation for
-    this direction specifically -- see below).
+  - **unhost**: single-player/co-op -> a fresh, never-joined dedicated
+    server, keeping their level, stats, inventory, unlocked tech, and
+    owned Pals intact (guild membership and built structures are a known
+    limitation for this direction specifically -- see below).
+  - **sync**: single-player/co-op -> an **already-live, already-populated**
+    dedicated server. Use this instead of `unhost` whenever the server
+    already has real progress for you and/or other people -- it updates
+    only your own character, owned Pals, and personal inventory/equipment,
+    and never touches anyone else, the guild(s), or built structures (see
+    below for why this needs a different technique than `unhost`).
 - **optioneditor** — edit a world's settings (`WorldOption.sav`):
   difficulty, day/night speed, every XP/damage/drop-rate slider, PvP and
   multiplayer toggles, and (for a dedicated server) the server
@@ -79,14 +85,17 @@ check "Add Python to PATH" during setup on Windows).
   python menu.py
   ```
 
-That gives you a choice of the two tools:
+That gives you a choice of the tools:
 
 ```
   [1] Migrate a dedicated-server character into single-player/co-op
       (hostfix -- keeps your level, Pals, guild, and base)
   [2] Convert a single-player/co-op world into a dedicated-server-ready save
-      (hostfix unhost -- keeps your level and Pals; see Limitations)
-  [3] Edit world settings (WorldOption.sav)
+      (hostfix unhost -- for a BRAND NEW server; see Limitations)
+  [3] Update your character on an ALREADY-LIVE dedicated server
+      (hostfix sync -- safe when the server already has real progress for
+       you and/or others; never touches other players, the guild, or builds)
+  [4] Edit world settings (WorldOption.sav)
       (optioneditor -- difficulty, rates, PvP, server settings, etc.)
   [0] Exit
 ```
@@ -137,21 +146,46 @@ you.
 #### 2) hostfix unhost — prep a single-player/co-op world for a dedicated server
 
 The reverse direction: turns your single-player or co-op world into a
-save ready to seed a brand-new dedicated server (one nobody's joined
-yet). Same kind of walkthrough as above, just pick option `[2]` from the
-menu. It'll usually highlight the right character for you automatically:
+save ready to drop onto a dedicated server.
+
+**This needs one thing to happen first, and it can't be skipped:** a
+dedicated-server player ID isn't something anyone can invent -- Palworld
+computes it from a one-way hash of the connecting player's own Steam
+account, the same value every time. There's no way to reserve an
+arbitrary ID in a save file in advance and have a real player show up as
+it. So before running `unhost`, you need to:
+
+1. Start your dedicated server (it can already have other stuff on it, or
+   be completely fresh -- either way, at this point it doesn't have you).
+2. Connect to it **once** with the real account you're going to play as,
+   then disconnect and fully stop the server. This makes the server
+   compute and assign your real ID, saved as a blank, freshly-spawned
+   character.
+3. Now run `unhost` -- pick option `[2]` from the menu. It'll ask you to
+   confirm you've done steps 1-2, then walk you through picking your
+   single-player character *and* pointing it at the server's save folder
+   so it can find the real ID the server just assigned you:
 
 ```
+Have you already started your dedicated server, connected to it ONCE with
+the real account you'll play as, and then fully stopped the server again? [y/N] y
+
+Path to your SINGLE-PLAYER/CO-OP world folder (...): C:\...\SaveGames\76561...\WorldGUID
 Found 1 player(s) in this world:
 
   [1] UID: 00000000-0000-0000-0000-000000000001  <- already the single-player host ID
-      file: Players/00000000000000000000000000000001.sav  (14,958 bytes)
-      referenced 19877 time(s) in Level.sav
-      best-effort name guess: (none found)
-
-(Usually you want the one tagged as the single-player host ID -- that's [1].)
-
+      ...
 Which one do you want to move onto the dedicated server? [1-1]: 1
+
+Now point me at your DEDICATED SERVER's save folder (...): C:\...\PalServer\...\SaveGames\0\WorldGUID
+Found 1 player(s) already on that server:
+
+  [1] UID: 7c3a9f10-0000-0000-0000-000000000000
+      file: Players/7C3A9F10000000000000000000000000.sav  (6,111 bytes)
+      ...
+(This should be the blank, freshly-spawned character the server made
+when you connected just now -- pick whichever one is you.)
+Which one is the real you on the server? [1-1]: 1
 
 Where should the server-ready save be written? [.../MyWorld_dedicated]:
 Rename the world (as it'll show in the server's world name)? Leave blank to keep the original name:
@@ -163,20 +197,100 @@ Found 1253 safely-verified character/Pal reference(s) to 00000000-0000-0000-0000
 Proceed with the conversion? [y/N] y
 ```
 
-The "referenced N time(s)" count in the player list above is a rough,
-unverified scan (same as `migrate` shows) -- for the special single-player
-host ID it's normal for this to look much bigger than the actual number
-of things that get migrated, because that specific ID happens to
-coincidentally match a lot of unrelated padding elsewhere in the file.
-The "safely-verified" count printed right before the confirmation prompt
-is the real one; see [Safety](#safety) below for why the two differ.
+(In the single-player world's player list, ignore the "referenced N
+time(s)" line for the single-player host ID -- it's a rough, unverified
+scan, and for that specific ID it always looks much bigger than the real
+number of things that end up migrated. The "safely-verified" count
+printed right before the confirmation prompt is the real one; see
+[Safety](#safety) below for why the two differ.)
 
-Once it's done, copy the output folder's contents into your dedicated
-server's save folder the same way as described in "Last step after
-migrating" below, just into your server's save directory instead of your
-local single-player one.
+Once it's done, copy the output folder's contents **over** your dedicated
+server's save folder -- the same one you pointed at above -- replacing
+the blank character the server made in step 2. Don't put it in a new
+folder; the whole point is that it needs to land under the exact ID the
+server is expecting.
 
-#### 3) optioneditor — edit world settings
+**Important:** `unhost` assumes the destination server doesn't have
+anything of yours on it yet. If your server already has real progress --
+for you or for anyone else -- **use `sync` instead** (option `[3]`, next
+section). A whole-world push onto a server that already has other real
+players on it will destroy their data; see
+[why single-player mode is a bad long-term substitute](#why-single-player-mode-is-a-bad-long-term-substitute-for-a-shut-down-server)
+below for a real example of just how much damage that can do, even
+without `unhost` being involved at all.
+
+#### 3) hostfix sync — update your character on an already-live server
+
+Say your dedicated server went down, you kept playing solo as a
+stopgap using `migrate`, and now you want to bring that progress back to
+the shared server (which still has your and everyone else's real data on
+it). `unhost` is the wrong tool here: it's built for a brand-new server
+that doesn't know you yet, and pushing your whole single-player
+`Level.sav` over an already-populated one would overwrite every other
+player's data with your solo save's (possibly stale, or even
+degraded -- see the note linked above) copy of them.
+
+`sync` instead surgically updates **only your own stuff**: your character
+record, every Pal you currently own, and your personal containers
+(inventory, equipped gear, party, Palbox). It parses both worlds properly
+rather than doing a raw byte patch, so it can add and remove entries
+cleanly -- and it never even opens the guild or building data, so those
+are guaranteed byte-for-byte untouched no matter what.
+
+From the menu, pick option `[3]`:
+
+```
+Path to your SINGLE-PLAYER/CO-OP world folder (...): C:\...\SaveGames\76561...\WorldGUID
+Found 1 player(s) in this world:
+
+  [1] UID: 00000000-0000-0000-0000-000000000001  <- already the single-player host ID
+      ...
+Which one do you want to sync onto the server? [1-1]: 1
+
+Now point me at your LIVE DEDICATED SERVER's save folder (...): C:\...\PalServer\...\SaveGames\0\WorldGUID
+Found 5 player(s) already on that server:
+
+  [1] UID: 1e129d9a-0000-0000-0000-000000000000
+      file: Players/1E129D9A000000000000000000000000.sav  (14,958 bytes)
+      ...
+  [2] UID: bbbbbbbb-0000-0000-0000-000000000000
+      ...
+Which one is you on the server? [1-5]: 1
+
+Where should the updated server save be written? [.../WorldGUID_synced]:
+
+CharacterSaveParameterMap: replacing 1 stale server record(s) with 68 fresh one(s) from
+your single-player save (your character + every Pal you currently own).
+Containers: replacing 6 item container(s) (inventory/equipment) and 2 character
+container(s) (party/Palbox).
+
+Everything else on the server -- every other player, the guild(s), and all
+placed/built structures -- is untouched: not read, not re-serialized, not written.
+
+Proceed and write the updated server save? [y/N] y
+```
+
+Unlike `unhost`, there's no "join once with a blank character first" step
+-- you already exist on the server, so `sync` just needs to know which
+existing server player is you.
+
+If a Pal in your single-player save happens to share an ID with something
+that already exists on the server under someone (or something) else, it's
+reported and left alone rather than risking a duplicate or an overwrite:
+
+```
+Heads up: 4 Pal(s) in your single-player save share an ID with something that
+already exists on the server under someone or something else -- these were
+left as-is on the server rather than risk duplicating or overwriting them:
+    d2a40080-4852-84c3-0a7c-95876462933c
+    ...
+```
+
+Once it's done, copy the output folder's contents **over** your dedicated
+server's save folder, same as `unhost` -- make sure the server is fully
+stopped first.
+
+#### 4) optioneditor — edit world settings
 
 Point it at a `WorldOption.sav` (the migrated one from step 1, or any
 world's) and pick a category, then a setting, then type a new value:
@@ -238,19 +352,43 @@ python hostfix.py migrate /path/to/world_folder \
 `--world-name` is optional, `-y`/`--yes` skips the confirmation prompt.
 Run `python hostfix.py migrate --help` for the full flag list.
 
-The reverse direction:
+The reverse direction -- **`--new-uid` is required and can't be made up**
+(see the walkthrough above for why): start your dedicated server, connect
+to it once with the real account you'll play as, fully stop the server,
+then find that real ID with `list` before running `unhost`:
 
 ```
+python hostfix.py list /path/to/server_save_folder
+# -> note the UID it reports for the blank character you just made
+
 python hostfix.py unhost /path/to/single_player_world_folder \
+    --new-uid <the real ID from the step above> \
     --out /path/to/single_player_world_folder_dedicated \
     --world-name "My World" \
     -y
 ```
 
 `--old-uid` defaults to the single-player host ID
-(`00000000-0000-0000-0000-000000000001`); `--new-uid` defaults to a
-random, non-colliding dedicated-server-shaped ID if you don't pass one.
-Run `python hostfix.py unhost --help` for the full flag list.
+(`00000000-0000-0000-0000-000000000001`). Run `python hostfix.py unhost
+--help` for the full flag list.
+
+If your dedicated server **already has real progress** (for you and/or
+other people), use `sync` instead of `unhost` -- same idea, but it only
+touches your own data:
+
+```
+python hostfix.py list /path/to/server_save_folder
+# -> note your existing, already-established UID on that server
+
+python hostfix.py sync /path/to/single_player_world_folder \
+    --server-dir /path/to/server_save_folder \
+    --target-uid <your real ID from the step above> \
+    --out /path/to/server_save_folder_synced \
+    -y
+```
+
+`--old-uid` defaults to the single-player host ID, same as `unhost`. Run
+`python hostfix.py sync --help` for the full flag list.
 
 **optioneditor** — inspect or change one setting at a time:
 
@@ -297,18 +435,27 @@ slot that you'd rather keep (e.g. from previously joining the same server
 as a client from this PC), back it up before copying the migrated files
 over it.
 
-**For `unhost` (-> a fresh dedicated server):** copy the *contents* of
-the output folder into your dedicated server's save folder, e.g.:
+**For `unhost` (-> a dedicated server):** copy the *contents* of the
+output folder **over** your dedicated server's save folder, e.g.:
 
 ```
 <PalServer install>\Pal\Saved\SaveGames\0\<WorldGUID>\
 ```
 
-If this is a brand-new server, launch it once first so it generates that
-folder, then fully stop the server before copying the files in.
+This is the same folder you already connected to once and pointed the
+tool at (see the walkthrough above) -- copying in replaces the blank
+character the server made for you, under the real ID it's expecting.
+Make sure the server is fully stopped first.
 `LocalData.sav` is intentionally not copied for this direction —
 dedicated servers don't use it; each player who joins later builds up
 their own copy on their own PC.
+
+**For `sync` (-> an already-live dedicated server):** same as `unhost` --
+copy the *contents* of the output folder **over** the server's save
+folder, with the server fully stopped first. The output only ever
+contains `Level.sav` and your own `Players/<uid>.sav` — no other player's
+file, `LevelMeta.sav`, or `WorldOption.sav` are touched or written, since
+`sync` never has a reason to change them.
 
 ## Safety
 
@@ -329,6 +476,13 @@ their own copy on their own PC.
   writing anything.
 
 **hostfix unhost (single-player/co-op -> dedicated server):**
+- Requires a real `--new-uid` and refuses to guess one. A dedicated-server
+  player ID is a one-way hash of the connecting player's own Steam
+  account, computed by the game itself -- not a value a save file can
+  reserve or a tool can invent. (An earlier version of this tool *did*
+  generate a random one, which produced saves nobody could actually log
+  in as — the game just created a new character instead. Fixed by
+  requiring the real ID, found via `list` after joining the server once.)
 - Never writes to your source folder — always a new output folder.
 - Refuses to run if the target ID already has an existing player save on
   disk, same as `migrate`, unless you pass `--force`.
@@ -351,6 +505,31 @@ their own copy on their own PC.
   and any structures you'd built are **not** migrated by this direction —
   see Limitations below.
 - Same before-writing byte-count verification as `migrate`.
+
+**hostfix sync (single-player/co-op -> an already-live dedicated server):**
+- Never writes to either your single-player world or your server's save
+  folder — always a new output folder.
+- Never does a whole-file replace or touches the destination `Level.sav`
+  as an opaque blob. It parses both worlds structurally (via
+  `palworld-save-tools`' JSON dump/load round-trip, verified byte-for-byte
+  identical on real production saves when left unmodified) and only
+  replaces the entries structurally keyed to the target player: their own
+  `CharacterSaveParameterMap` record, every Pal entry keyed to their
+  `PlayerUId`, and their personal `ItemContainerSaveData`/
+  `CharacterContainerSaveData` entries (matched by container ID read
+  cleanly off each side's own `Players/<uid>.sav`, which is not opaque the
+  way the map's `RawData` blobs are).
+- Every other player, `GroupSaveDataMap` (guild), and `MapObjectSaveData`
+  (buildings) in the destination are never even inspected for changes —
+  verified on real production data to come out byte-for-byte /
+  structurally identical before and after a sync.
+- If a Pal being added from your single-player save shares an `InstanceId`
+  with something already present in the destination under someone (or
+  something) else, it's skipped and reported rather than duplicated or
+  overwritten.
+- Re-parses its own output with `palworld-save-tools` before considering
+  the run successful, and checks for duplicate `InstanceId`/container `ID`
+  values in the result.
 
 **optioneditor:**
 - Only ever touches the one file you point it at, and only the specific
@@ -395,6 +574,31 @@ edit binary save file internals; that's inherently not risk-free.
 - Tested against real-world saves from a private dedicated server; if you
   hit a save shape either tool doesn't handle, please open an issue with
   (a redacted version of) the error.
+
+### Why single-player mode is a bad long-term substitute for a shut-down server
+
+If your dedicated server is down and you keep playing solo with `migrate`
+as a stopgap, don't treat that single-player save as a safe, lossless
+stand-in for the shared world for very long. In testing, a real
+single-player save that had only been played solo for about two days
+showed the *other*, non-connectable players' owned-Pal data measurably
+degraded compared to the same players on the last real server save --
+raw reference counts for four different real players dropped
+(for example, one went from 345 references down to 5; another from 5,000
+down to about 2,943) even though nothing about those players' data should
+have changed at all during solo play. The active player's own data stayed
+intact throughout.
+
+This isn't a bug in this tool -- it's Palworld's single-player save
+pruning data for accounts it doesn't consider "present," and it's why
+`unhost` explicitly assumes a brand-new server: pushing a solo save's
+whole `Level.sav` back over a server that already has other real people's
+progress on it would carry this degradation into their data too, on top
+of overwriting it outright. If your server already has anyone else's real
+progress (or even just older progress of your own you want to keep), use
+`sync` instead, which never reads or writes anything belonging to another
+player in the first place -- so this degradation, wherever it happens to
+live in your solo save, can never reach the server.
 
 ## Credits / prior art
 

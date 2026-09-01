@@ -9,9 +9,12 @@ this (or run `python menu.py`) to pick between the bundled tools:
                             single-player/co-op
   2) hostfix (unhost)   -- convert a single-player/co-op world into a
                             dedicated-server-ready save
-  3) optioneditor       -- edit a world's settings (WorldOption.sav)
+  3) hostfix (sync)     -- update YOUR character on an already-live
+                            dedicated server from a single-player/co-op
+                            save, without touching anyone else
+  4) optioneditor       -- edit a world's settings (WorldOption.sav)
 
-Both hostfix directions and optioneditor can still be run directly
+Both hostfix directions, sync, and optioneditor can still be run directly
 (`python hostfix.py`, `python optioneditor.py`) with their own CLI flags
 for power users -- this is just a friendly landing page for everyone
 else.
@@ -29,15 +32,18 @@ def main() -> None:
     print("  [1] Migrate a dedicated-server character into single-player/co-op")
     print("      (hostfix -- keeps your level, Pals, guild, and base)")
     print("  [2] Convert a single-player/co-op world into a dedicated-server-ready save")
-    print("      (hostfix unhost -- keeps your level and Pals; see README for limitations)")
-    print("  [3] Edit world settings (WorldOption.sav)")
+    print("      (hostfix unhost -- for a BRAND NEW server; see README for limitations)")
+    print("  [3] Update your character on an ALREADY-LIVE dedicated server")
+    print("      (hostfix sync -- safe when the server already has real progress for")
+    print("       you and/or others; never touches other players, the guild, or builds)")
+    print("  [4] Edit world settings (WorldOption.sav)")
     print("      (optioneditor -- difficulty, rates, PvP, server settings, etc.)")
     print("  [0] Exit")
     print()
 
     while True:
         try:
-            choice = input("Pick an option [0-3]: ").strip()
+            choice = input("Pick an option [0-4]: ").strip()
         except EOFError:
             return
         if choice == "0":
@@ -51,6 +57,10 @@ def main() -> None:
             hostfix.run_interactive_unhost()
             return
         if choice == "3":
+            import hostfix
+            hostfix.run_interactive_sync()
+            return
+        if choice == "4":
             import optioneditor
             try:
                 optioneditor.run_interactive()
@@ -59,7 +69,7 @@ def main() -> None:
             except optioneditor.OptionEditorError as e:
                 print(f"\nSomething went wrong:\n  {e}")
             return
-        print("  (please enter 0, 1, 2, or 3)")
+        print("  (please enter 0, 1, 2, 3, or 4)")
 
 
 if __name__ == "__main__":
