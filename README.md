@@ -335,6 +335,48 @@ the handful of dropdown-style settings (`Difficulty`, `DeathPenalty`,
 anything else so you can't accidentally save a value the game won't
 understand.
 
+#### Turning WorldOption.sav into a PalWorldSettings.ini
+
+Here's a Palworld dedicated-server gotcha that trips people up: **a
+handful of settings are only ever read from `PalWorldSettings.ini`, never
+from `WorldOption.sav`** — specifically server identity/network fields
+like `ServerName`, `ServerPassword`, `AdminPassword`, `PublicPort`,
+`PublicIP`, the RCON/REST API settings, and `bIsMultiplay`. Everything
+else works the other way around: if `WorldOption.sav` exists in the
+world's save folder, the server uses *that* instead of the ini for
+gameplay settings (rates, difficulty, PvP, etc.). So if you used
+optioneditor to change, say, `ServerName` and it didn't take effect on
+your dedicated server even though it worked fine in single-player, this
+is why — that field simply isn't read from the `.sav` on a server.
+
+From the category screen in optioneditor's interactive mode, pick
+**`[E]`** to export every setting currently in the `WorldOption.sav`
+you're editing into a real `PalWorldSettings.ini`:
+
+```
+  [E] Export these settings as a PalWorldSettings.ini (for a dedicated server)
+
+Write the ini to (...): C:\...\PalWorldSettings.ini
+Wrote C:\...\PalWorldSettings.ini
+```
+
+Or from the command line:
+
+```
+python optioneditor.py export-ini /path/to/WorldOption.sav
+```
+
+Then stop your server, replace its
+`<PalServer install>\Pal\Saved\Config\WindowsServer\PalWorldSettings.ini`
+(or `.../LinuxServer/...` on Linux) with the generated file, and start it
+back up — settings are only read at boot. A field whose value can't be
+safely written into the ini's single-line format (an unrecognized
+property type, or a string containing a literal double-quote) is skipped
+rather than guessed at, and listed for you to set by hand; `.ini`s
+tolerate missing fields fine (anything left out just falls back to the
+game's default), so a couple of skipped edge cases is far safer than
+risking one malformed value breaking the whole line.
+
 ### Power-user mode: the command line
 
 **hostfix** — same two steps, scriptable:
@@ -399,6 +441,10 @@ python optioneditor.py set /path/to/WorldOption.sav ExpRate 3.0
 python optioneditor.py set /path/to/WorldOption.sav bIsMultiplay true
 python optioneditor.py set /path/to/WorldOption.sav Difficulty Hard
 python optioneditor.py set /path/to/WorldOption.sav ServerName "My Server" --out /path/to/new_WorldOption.sav
+
+python optioneditor.py export-ini /path/to/WorldOption.sav
+# -> writes PalWorldSettings.ini next to it; see "Turning WorldOption.sav
+#    into a PalWorldSettings.ini" above for why you'd want this
 ```
 
 `show` prints every setting (organized the same way as the wizard) so you

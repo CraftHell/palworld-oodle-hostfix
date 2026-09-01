@@ -31,6 +31,15 @@ Usage
     python optioneditor.py set /path/to/WorldOption.sav ExpRate 3.0
     python optioneditor.py set /path/to/WorldOption.sav bIsMultiplay true
 
+    # Generate a PalWorldSettings.ini from a WorldOption.sav's current
+    # settings -- useful for a dedicated server, since a handful of fields
+    # (ServerName, ServerPassword, PublicPort, bIsMultiplay, and similar
+    # identity/network settings) are only ever read from the ini, even
+    # when a WorldOption.sav also exists and takes priority for everything
+    # else. Also available from the interactive menu ([E] on the category
+    # screen).
+    python optioneditor.py export-ini /path/to/WorldOption.sav
+
 Always makes a ``.bak`` backup of the original file the first time it
 writes to a given path in a session, and never touches anything until you
 confirm.
@@ -258,6 +267,97 @@ def set_value(name: str, prop: dict, raw_input_str: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Export to PalWorldSettings.ini
+#
+# WorldOption.sav and PalWorldSettings.ini store the exact same underlying
+# settings struct -- one as a binary GVAS property map, the other as a
+# single comma-separated OptionSettings=(...) line of plain text. This
+# reformats the values already parsed out of a .sav into that ini syntax,
+# rather than re-deriving them some other way.
+#
+# On a dedicated server, WorldOption.sav (if present) takes priority over
+# the ini for most gameplay settings, but a handful of identity/network
+# fields -- ServerName, ServerPassword, AdminPassword, PublicPort,
+# PublicIP, RCON*, bIsMultiplay, and similar -- are always read from the
+# ini instead, regardless of what's in the .sav. That's the scenario this
+# export is for: getting those fields (and everything else, for
+# completeness) into a real ini the server will actually honor.
+#
+# A field whose value can't be safely written as one ini token (an
+# unrecognized property type, or a string containing a literal double
+# quote, which would break the surrounding quoting) is skipped rather than
+# guessed at -- one malformed token would make the game ignore the whole
+# OptionSettings line, and PalWorldSettings.ini tolerates a partial list
+# (anything omitted just falls back to the game's default), so skipping a
+# handful of edge-case fields is far safer than writing something that
+# might not parse.
+# --------------------------------------------------------------------------
+def format_ini_value(name: str, prop: dict) -> str:
+    """Render one setting's value the way PalWorldSettings.ini's
+    OptionSettings=(...) line expects it. NOT the same formatting as
+    format_value() above (which is for the interactive display) -- e.g.
+    booleans are 'True'/'False' here, not 'true'/'false', and floats are
+    always shown with 6 decimal places to match the game's own generated
+    inis. Raises ValueError if this value can't be safely represented."""
+    t = prop.get("type")
+    if t == "BoolProperty":
+        return "True" if prop["value"] else "False"
+    if t == "IntProperty":
+        return str(prop["value"])
+    if t == "FloatProperty":
+        return f"{float(prop['value']):.6f}"
+    if t in ("StrProperty", "NameProperty"):
+        val = str(prop["value"])
+        if '"' in val:
+            raise ValueError("contains a double-quote character, can't be safely quoted")
+        return f'"{val}"'
+    if t == "EnumProperty":
+        return str(prop["value"]["value"]).split("::")[-1]
+    if t == "ArrayProperty":
+        values = prop["value"]["values"]
+        if prop.get("array_type") == "EnumProperty":
+            items = [str(v).split("::")[-1] for v in values]
+        else:
+            items = []
+            for v in values:
+                v = str(v)
+                if '"' in v:
+                    raise ValueError("contains an item with a double-quote character")
+                items.append(f'"{v}"')
+        return "(" + ",".join(items) + ")"
+    raise ValueError(f"unrecognized property type {t!r}")
+
+
+def build_ini_text(settings: dict) -> tuple[str, list[tuple[str, str]]]:
+    """Returns (ini_text, skipped) where skipped is [(field_name, reason), ...]
+    for anything left out of the output."""
+    parts = []
+    skipped: list[tuple[str, str]] = []
+    for name, prop in settings.items():
+        try:
+            parts.append(f"{name}={format_ini_value(name, prop)}")
+        except ValueError as e:
+            skipped.append((name, str(e)))
+    ini_text = "[/Script/Pal.PalGameWorldSettings]\nOptionSettings=(" + ",".join(parts) + ")\n"
+    return ini_text, skipped
+
+
+def export_ini(world_option_path: Path, out_path: Path, force: bool) -> list[tuple[str, str]]:
+    """Load a WorldOption.sav and write out_path as a PalWorldSettings.ini
+    built from its current settings. Returns the list of (field, reason)
+    skipped. Raises OptionEditorError for validation problems."""
+    _, _, settings = load_world_option(world_option_path)
+    ini_text, skipped = build_ini_text(settings)
+    if out_path.exists() and not force:
+        raise OptionEditorError(
+            f"{out_path} already exists -- refusing to overwrite it without confirmation.\n"
+            "(Back up or rename your existing PalWorldSettings.ini first if you want to keep it.)"
+        )
+    out_path.write_text(ini_text, encoding="utf-8")
+    return skipped
+
+
+# --------------------------------------------------------------------------
 # Interactive wizard
 # --------------------------------------------------------------------------
 def _prompt(msg: str, default: str | None = None) -> str:
@@ -335,6 +435,48 @@ def _edit_one_field(settings: dict, name: str) -> None:
     print(f"  -> {name} is now {format_value(name, prop)}  (not saved yet)")
 
 
+def _run_export_ini_prompt(world_option_path: Path) -> None:
+    default_out = str(world_option_path.parent / "PalWorldSettings.ini")
+    out_str = _prompt(
+        "Write the ini to (usually <PalServer install>\\Pal\\Saved\\Config\\WindowsServer\\"
+        "PalWorldSettings.ini on the SERVER, not this world folder -- you'll need to move it "
+        "there yourself)",
+        default=default_out,
+    )
+    out_path = Path(out_str)
+    force = False
+    if out_path.exists():
+        if not _prompt_yes_no(f"{out_path} already exists -- overwrite it?", default=False):
+            print("Cancelled, nothing was written.")
+            return
+        force = True
+    try:
+        skipped = export_ini(world_option_path, out_path, force=force)
+    except OptionEditorError as e:
+        print(f"\nSomething went wrong:\n  {e}")
+        return
+    print(f"\nWrote {out_path}")
+    if skipped:
+        print(
+            f"\n{len(skipped)} field(s) couldn't be safely written and were left out -- set "
+            "these by hand in the ini if you need them:"
+        )
+        for name, reason in skipped:
+            print(f"    {name}  ({reason})")
+    print(
+        "\nStop your server, replace its PalWorldSettings.ini with this file, then start it "
+        "back up (settings are only read at boot).\n"
+        "Note: as long as a WorldOption.sav also exists in the server's save folder, it takes "
+        "priority over this ini for most gameplay settings -- but server "
+        "identity/network fields (name, password, port, the multiplayer toggle, and similar) "
+        "are always read from the ini regardless, which is usually why you'd want this export "
+        "in the first place.\n"
+        "If anything in the generated file looks off, the safest fallback is copying your "
+        "server's own DefaultPalWorldSettings.ini and editing just the fields you care about "
+        "by hand instead."
+    )
+
+
 def run_interactive(initial_path: str | None = None) -> None:
     print("=" * 70)
     print(" optioneditor -- edit a Palworld WorldOption.sav")
@@ -363,7 +505,18 @@ def run_interactive(initial_path: str | None = None) -> None:
         for i, (cat_name, fields) in enumerate(categories, start=1):
             print(f"  [{i}] {cat_name}  ({len(fields)} settings)")
         print(f"  [0] {'Save and exit' if dirty else 'Exit'}" + (" (unsaved changes!)" if dirty else ""))
-        cat_choice = _prompt_choice("Pick a category", len(categories))
+        print("  [E] Export these settings as a PalWorldSettings.ini (for a dedicated server)")
+        try:
+            raw = input(f"Pick a category [0-{len(categories)}, or E]: ").strip()
+        except EOFError:
+            raise EditAborted()
+        if raw.lower() == "e":
+            _run_export_ini_prompt(path)
+            continue
+        if not (raw.isdigit() and 0 <= int(raw) <= len(categories)):
+            print(f"  (please enter a number from 0 to {len(categories)}, or E)")
+            continue
+        cat_choice = int(raw)
         if cat_choice == 0:
             break
 
@@ -428,6 +581,20 @@ def cmd_set(args: argparse.Namespace) -> None:
     print(f"Wrote {out_path}" + ("" if args.no_backup else f"  (backup at {out_path}.bak if it existed)"))
 
 
+def cmd_export_ini(args: argparse.Namespace) -> None:
+    path = Path(args.path)
+    out_path = Path(args.out) if args.out else path.with_name("PalWorldSettings.ini")
+    try:
+        skipped = export_ini(path, out_path, force=args.force)
+    except OptionEditorError as e:
+        sys.exit(str(e))
+    print(f"Wrote {out_path}")
+    if skipped:
+        print(f"{len(skipped)} field(s) skipped (couldn't be safely written as ini values):")
+        for name, reason in skipped:
+            print(f"    {name}  ({reason})")
+
+
 def main() -> None:
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and Path(sys.argv[1]).suffix.lower() == ".sav"):
         # No arguments, or just a dropped-in file path -- run the friendly
@@ -465,6 +632,18 @@ def main() -> None:
     p_set.add_argument("--out", default=None, help="Write to a different file instead of in-place")
     p_set.add_argument("--no-backup", action="store_true", help="Don't write a .bak backup")
     p_set.set_defaults(func=cmd_set)
+
+    p_export = sub.add_parser(
+        "export-ini",
+        help="Generate a PalWorldSettings.ini from a WorldOption.sav's current settings",
+    )
+    p_export.add_argument("path", help="Path to WorldOption.sav")
+    p_export.add_argument(
+        "--out", default=None,
+        help="Output path (default: PalWorldSettings.ini next to the input file)",
+    )
+    p_export.add_argument("--force", action="store_true", help="Overwrite --out if it already exists")
+    p_export.set_defaults(func=cmd_export_ini)
 
     args = parser.parse_args()
     try:
